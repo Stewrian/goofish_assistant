@@ -71,3 +71,29 @@
   font-size: 0.875rem;
   font-weight: 500;
 }
+
+.order-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+}
+
+.order-kpi-item {
+  background: var(--bg-color);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  padding: 1rem 1.25rem;
+}
+
+.order-kpi-label {
+  font-size: 0.875rem;
+  color: var(--secondary-color);
+  margin-bottom: 0.5rem;
+}
+
+.order-kpi-value {
+  font-size: 1.6rem;
+  font-weight: 700;
+  color: var(--text-color);
+  line-height: 1.2;
+}

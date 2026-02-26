@@ -348,11 +348,11 @@ async function loadDashboard() {
 
         dashboardData.totalKeywords = totalKeywords;
 
-        // 加载订单数量
-        await loadOrdersCount();
+        // 加载订单看板数据
+        const orderMetrics = await loadOrderDashboardMetrics();
 
         // 更新仪表盘显示
-        updateDashboardStats(accountsWithKeywords.length, totalKeywords, enabledAccounts);
+        updateDashboardStats(accountsWithKeywords.length, totalKeywords, enabledAccounts, orderMetrics.totalOrders);
         updateDashboardAccountsList(accountsWithKeywords);
     }
     } catch (error) {
@@ -363,8 +363,15 @@ async function loadDashboard() {
     }
 }
 
-// 加载订单数量
-async function loadOrdersCount() {
+// 加载仪表盘订单指标
+async function loadOrderDashboardMetrics() {
+    const defaultMetrics = {
+        totalOrders: 0,
+        totalSalesAmount: 0,
+        completionRate: 0,
+        todayOrders: 0
+    };
+
     try {
         const token = localStorage.getItem('auth_token');
         const response = await fetch('/api/orders', {
@@ -374,24 +381,147 @@ async function loadOrdersCount() {
         });
 
         const data = await response.json();
-        if (data.success) {
-            const ordersCount = data.data ? data.data.length : 0;
-            document.getElementById('totalOrders').textContent = ordersCount;
-        } else {
+        if (!data.success) {
             console.error('加载订单数量失败:', data.message);
-            document.getElementById('totalOrders').textContent = '0';
+            updateDashboardOrderMetrics(defaultMetrics);
+            return defaultMetrics;
         }
+
+        const orders = Array.isArray(data.data) ? data.data : [];
+        const totalOrders = orders.length;
+
+        let totalSalesAmount = 0;
+        let completedOrders = 0;
+        let completionEligibleOrders = 0;
+        let todayOrders = 0;
+
+        orders.forEach(order => {
+            const normalizedStatus = normalizeOrderStatus(order?.order_status);
+            const parsedAmount = parseOrderAmount(order);
+            totalSalesAmount += parsedAmount;
+
+            if (isCompletionEligibleOrder(normalizedStatus)) {
+                completionEligibleOrders++;
+                if (isCompletedOrder(normalizedStatus)) {
+                    completedOrders++;
+                }
+            }
+
+            if (isTodayOrder(order?.created_at)) {
+                todayOrders++;
+            }
+        });
+
+        const metrics = {
+            totalOrders,
+            totalSalesAmount,
+            completionRate: completionEligibleOrders > 0 ? (completedOrders / completionEligibleOrders) * 100 : 0,
+            todayOrders
+        };
+
+        updateDashboardOrderMetrics(metrics);
+        return metrics;
     } catch (error) {
         console.error('加载订单数量失败:', error);
-        document.getElementById('totalOrders').textContent = '0';
+        updateDashboardOrderMetrics(defaultMetrics);
+        return defaultMetrics;
+    }
+}
+
+function parseOrderAmount(order) {
+    const amountCandidates = [
+        order?.amount,
+        order?.total_amount,
+        order?.order_amount,
+        order?.pay_amount,
+        order?.price
+    ];
+
+    for (const amount of amountCandidates) {
+        if (amount === undefined || amount === null || amount === '') continue;
+        const normalized = String(amount).replace(/[^\d.-]/g, '');
+        const numericAmount = parseFloat(normalized);
+        if (!Number.isNaN(numericAmount)) {
+            return numericAmount;
+        }
+    }
+
+    return 0;
+}
+
+function normalizeOrderStatus(status) {
+    const value = String(status || '').toLowerCase();
+    const aliasMap = {
+        success: 'completed',
+        finished: 'completed',
+        pending_ship: 'pending_delivery',
+        delivered: 'shipped',
+        cancelled: 'closed',
+        refunded: 'closed'
+    };
+    return aliasMap[value] || value || 'unknown';
+}
+
+function isCompletedOrder(normalizedStatus) {
+    return normalizedStatus === 'completed';
+}
+
+function isCompletionEligibleOrder(normalizedStatus) {
+    const completionEligibleStatuses = ['pending_delivery', 'shipped', 'completed', 'closed'];
+    return completionEligibleStatuses.includes(normalizedStatus);
+}
+
+function isTodayOrder(createdAt) {
+    if (!createdAt) return false;
+
+    const orderDate = new Date(createdAt);
+    if (Number.isNaN(orderDate.getTime())) return false;
+
+    const now = new Date();
+    return (
+        orderDate.getFullYear() === now.getFullYear() &&
+        orderDate.getMonth() === now.getMonth() &&
+        orderDate.getDate() === now.getDate()
+    );
+}
+
+function updateDashboardOrderMetrics(metrics) {
+    const totalOrdersEl = document.getElementById('dashboardOrderTotal');
+    const salesAmountEl = document.getElementById('dashboardSalesAmount');
+    const completionRateEl = document.getElementById('dashboardCompletionRate');
+    const todayOrdersEl = document.getElementById('dashboardTodayOrders');
+    const totalOrdersCardEl = document.getElementById('totalOrders');
+
+    if (totalOrdersEl) {
+        totalOrdersEl.textContent = metrics.totalOrders;
+    }
+
+    if (salesAmountEl) {
+        salesAmountEl.textContent = `￥${metrics.totalSalesAmount.toLocaleString('zh-CN', {
+            minimumFractionDigits: 2,
+            maximumFractionDigits: 2
+        })}`;
+    }
+
+    if (completionRateEl) {
+        completionRateEl.textContent = `${metrics.completionRate.toFixed(1)}%`;
+    }
+
+    if (todayOrdersEl) {
+        todayOrdersEl.textContent = metrics.todayOrders;
+    }
+
+    if (totalOrdersCardEl) {
+        totalOrdersCardEl.textContent = metrics.totalOrders;
     }
 }
 
 // 更新仪表盘统计数据
-function updateDashboardStats(totalAccounts, totalKeywords, enabledAccounts) {
+function updateDashboardStats(totalAccounts, totalKeywords, enabledAccounts, totalOrders = 0) {
     document.getElementById('totalAccounts').textContent = totalAccounts;
     document.getElementById('totalKeywords').textContent = totalKeywords;
     document.getElementById('activeAccounts').textContent = enabledAccounts;
+    document.getElementById('totalOrders').textContent = totalOrders;
 }
 
 // 更新仪表盘账号列表
@@ -11313,9 +11443,10 @@ function displayOrders() {
 function createOrderRow(order) {
     const statusClass = getOrderStatusClass(order.order_status);
     const statusText = getOrderStatusText(order.order_status);
+    const normalizedStatus = normalizeOrderStatus(order.order_status);
 
     // 判断是否可以手动发货（允许多次发货，除了交易关闭的订单）
-    const canDeliver = !['closed', 'refunded'].includes(order.order_status);
+    const canDeliver = !['closed', 'refunding'].includes(normalizedStatus);
 
     return `
         <tr>
@@ -11382,34 +11513,36 @@ function createOrderRow(order) {
 
 // 获取订单状态样式类
 function getOrderStatusClass(status) {
+    const normalizedStatus = normalizeOrderStatus(status);
     const statusMap = {
         'processing': 'bg-warning text-dark',
         'pending_payment': 'bg-warning text-dark',
         'pending_delivery': 'bg-info text-white',
         'shipped': 'bg-primary text-white',
+        'completed': 'bg-success text-white',
         'success': 'bg-success text-white',
         'refunding': 'bg-warning text-dark',
-        'refunded': 'bg-danger text-white',
         'closed': 'bg-secondary text-white',
         'unknown': 'bg-secondary text-white'
     };
-    return statusMap[status] || 'bg-secondary text-white';
+    return statusMap[normalizedStatus] || statusMap[status] || 'bg-secondary text-white';
 }
 
 // 获取订单状态文本
 function getOrderStatusText(status) {
+    const normalizedStatus = normalizeOrderStatus(status);
     const statusMap = {
         'processing': '处理中',
         'pending_payment': '待付款',
         'pending_delivery': '待发货',
         'shipped': '已发货',
+        'completed': '交易成功',
         'success': '交易成功',
-        'refunding': '退款中',
-        'refunded': '退款成功',
+        'refunding': '申请退款中',
         'closed': '交易关闭',
         'unknown': '未知'
     };
-    return statusMap[status] || status || '未知';
+    return statusMap[normalizedStatus] || statusMap[status] || status || '未知';
 }
 
 // 更新订单分页
