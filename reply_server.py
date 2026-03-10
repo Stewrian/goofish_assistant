@@ -8397,8 +8397,8 @@ async def apply_updates(current_user: Dict[str, Any] = Depends(get_current_user)
     下载并安装所有可用更新
     """
     try:
-        # 只允许管理员执行更新（检查username是否为admin）
-        if current_user.get('username') != 'admin':
+        # 只允许管理员执行更新，兼容历史 admin 用户名判断
+        if not current_user.get('is_admin') and current_user.get('username') != 'admin':
             raise HTTPException(status_code=403, detail="只有管理员可以执行更新")
         
         updater = get_updater()

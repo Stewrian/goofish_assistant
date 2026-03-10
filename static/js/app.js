@@ -16254,7 +16254,7 @@ async function performHotUpdate() {
                 }, 3000);
             }
         } else {
-            showToast('更新失败: ' + (result.message || result.data?.message || '未知错误'), 'danger');
+            showToast('更新失败: ' + (result.detail || result.message || result.data?.message || '未知错误'), 'danger');
         }
         
     } catch (error) {
