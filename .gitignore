@@ -798,3 +798,8 @@ logs/
 
 # 前端预览文件
 static/control-tower-preview.html
+
+# 本地保留的统计相关脚本
+usage_statistics.py
+simple_stats_server.py
+test_php_stats.py
