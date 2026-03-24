@@ -15353,7 +15353,7 @@ function exportSearchResults() {
 
 
 // 默认版本号（当无法读取 version.txt 时使用）
-const DEFAULT_VERSION = 'v1.7.4';
+const DEFAULT_VERSION = 'v1.7.5';
 
 // 当前本地版本号（动态从 version.txt 读取）
 let LOCAL_VERSION = DEFAULT_VERSION;
@@ -15467,9 +15467,19 @@ function clearIgnoredUpdateVersion(showFeedback = true) {
 
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
-    version: 'v1.7.4',
+    version: 'v1.7.5',
     intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
+        {
+            version: 'v1.7.5',
+            date: '2026-03-24',
+            updates: [
+                '【修复】修复扫码登录遇到人脸验证时直接返回外部链接导致验证会话丢失的问题，改为在服务端保持原始会话并生成验证二维码',
+                '【修复】修复扫码成功后仍可能再次进入滑块验证的问题，新增真实 Cookie 合并与首次 Token 预热保护',
+                '【优化】优化扫码风控状态收口，增加浏览器侧兜底判定，验证完成后可更稳定进入登录成功',
+                '【优化】优化扫码登录前端提示，减少重复提示并统一验证过程中的状态反馈'
+            ]
+        },
         {
             version: 'v1.7.4',
             date: '2026-03-22',
