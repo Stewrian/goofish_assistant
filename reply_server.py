@@ -34,6 +34,12 @@ from utils.time_utils import (
     utc_timestamp_to_local_date_string,
     utc_timestamp_to_local_datetime,
 )
+from utils.notification_dispatcher import (
+    SUPPORTED_NOTIFICATION_TEMPLATE_TYPES,
+    dispatch_account_notifications_sync,
+    guess_verification_type,
+    render_notification_template,
+)
 from order_event_hub import order_event_hub, publish_order_update_event
 
 from loguru import logger
@@ -2620,46 +2626,25 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     def send_face_verification_notification():
                         """在后台线程中发送人脸验证通知"""
                         try:
-                            from XianyuAutoAsync import XianyuLive
                             log_with_user('info', f"开始尝试发送人脸验证通知: {account_id}", current_user)
-                            
-                            # 尝试获取XianyuLive实例（如果账号已经存在）
-                            live_instance = XianyuLive.get_instance(account_id)
-                            
-                            if live_instance:
-                                log_with_user('info', f"找到账号实例，准备发送通知: {account_id}", current_user)
-                                # 创建新的事件循环来运行异步通知
-                                new_loop = asyncio.new_event_loop()
-                                asyncio.set_event_loop(new_loop)
-                                try:
-                                    new_loop.run_until_complete(
-                                        live_instance.send_token_refresh_notification(
-                                            error_message=message,
-                                            notification_type="face_verification",
-                                            verification_url=None,
-                                            attachment_path=actual_screenshot_path
-                                        )
-                                    )
-                                    log_with_user('info', f"✅ 已发送人脸验证通知: {account_id}", current_user)
-                                except Exception as notify_err:
-                                    log_with_user('error', f"发送人脸验证通知失败: {str(notify_err)}", current_user)
-                                    import traceback
-                                    log_with_user('error', f"通知错误详情: {traceback.format_exc()}", current_user)
-                                finally:
-                                    new_loop.close()
+                            notification_message = render_notification_template(
+                                'face_verify',
+                                account_id=account_id,
+                                time=time.strftime('%Y-%m-%d %H:%M:%S'),
+                                verification_url='无',
+                                verification_type=guess_verification_type(message, None)
+                            )
+                            notification_sent = dispatch_account_notifications_sync(
+                                account_id,
+                                notification_message,
+                                title='闲鱼账号需要验证',
+                                notification_type='face_verification',
+                                attachment_path=actual_screenshot_path,
+                            )
+                            if notification_sent:
+                                log_with_user('info', f"✅ 已发送人脸验证通知: {account_id}", current_user)
                             else:
-                                # 如果账号实例不存在，记录警告并尝试从数据库获取通知配置
-                                log_with_user('warning', f"账号实例不存在: {account_id}，尝试从数据库获取通知配置", current_user)
-                                try:
-                                    # 尝试从数据库获取通知配置
-                                    notifications = db_manager.get_account_notifications(account_id)
-                                    if notifications:
-                                        log_with_user('info', f"找到 {len(notifications)} 个通知配置，但需要账号实例才能发送", current_user)
-                                        log_with_user('warning', f"账号实例不存在，无法发送通知: {account_id}。请确保账号已登录并运行中。", current_user)
-                                    else:
-                                        log_with_user('warning', f"账号 {account_id} 未配置通知渠道", current_user)
-                                except Exception as db_err:
-                                    log_with_user('error', f"获取通知配置失败: {str(db_err)}", current_user)
+                                log_with_user('warning', f"人脸验证通知未发送成功: {account_id}", current_user)
                         except Exception as notify_err:
                             log_with_user('error', f"发送人脸验证通知时出错: {str(notify_err)}", current_user)
                             import traceback
@@ -2686,45 +2671,24 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     def send_face_verification_notification():
                         """在后台线程中发送人脸验证通知"""
                         try:
-                            from XianyuAutoAsync import XianyuLive
                             log_with_user('info', f"开始尝试发送人脸验证通知: {account_id}", current_user)
-                            
-                            # 尝试获取XianyuLive实例（如果账号已经存在）
-                            live_instance = XianyuLive.get_instance(account_id)
-                            
-                            if live_instance:
-                                log_with_user('info', f"找到账号实例，准备发送通知: {account_id}", current_user)
-                                # 创建新的事件循环来运行异步通知
-                                new_loop = asyncio.new_event_loop()
-                                asyncio.set_event_loop(new_loop)
-                                try:
-                                    new_loop.run_until_complete(
-                                        live_instance.send_token_refresh_notification(
-                                            error_message=message,
-                                            notification_type="face_verification",
-                                            verification_url=verification_url
-                                        )
-                                    )
-                                    log_with_user('info', f"✅ 已发送人脸验证通知: {account_id}", current_user)
-                                except Exception as notify_err:
-                                    log_with_user('error', f"发送人脸验证通知失败: {str(notify_err)}", current_user)
-                                    import traceback
-                                    log_with_user('error', f"通知错误详情: {traceback.format_exc()}", current_user)
-                                finally:
-                                    new_loop.close()
+                            notification_message = render_notification_template(
+                                'face_verify',
+                                account_id=account_id,
+                                time=time.strftime('%Y-%m-%d %H:%M:%S'),
+                                verification_url=verification_url or '无',
+                                verification_type=guess_verification_type(message, verification_url)
+                            )
+                            notification_sent = dispatch_account_notifications_sync(
+                                account_id,
+                                notification_message,
+                                title='闲鱼账号需要验证',
+                                notification_type='face_verification',
+                            )
+                            if notification_sent:
+                                log_with_user('info', f"✅ 已发送人脸验证通知: {account_id}", current_user)
                             else:
-                                # 如果账号实例不存在，记录警告并尝试从数据库获取通知配置
-                                log_with_user('warning', f"账号实例不存在: {account_id}，尝试从数据库获取通知配置", current_user)
-                                try:
-                                    # 尝试从数据库获取通知配置
-                                    notifications = db_manager.get_account_notifications(account_id)
-                                    if notifications:
-                                        log_with_user('info', f"找到 {len(notifications)} 个通知配置，但需要账号实例才能发送", current_user)
-                                        log_with_user('warning', f"账号实例不存在，无法发送通知: {account_id}。请确保账号已登录并运行中。", current_user)
-                                    else:
-                                        log_with_user('warning', f"账号 {account_id} 未配置通知渠道", current_user)
-                                except Exception as db_err:
-                                    log_with_user('error', f"获取通知配置失败: {str(db_err)}", current_user)
+                                log_with_user('warning', f"人脸验证通知未发送成功: {account_id}", current_user)
                         except Exception as notify_err:
                             log_with_user('error', f"发送人脸验证通知时出错: {str(notify_err)}", current_user)
                             import traceback
@@ -2914,45 +2878,28 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
 
                 # 发送登录成功通知（使用模板系统）
                 try:
-                    from utils.slider_patch import send_notification
-                    from db_manager import db_manager
-
                     # 根据模式选择不同模板
                     notify_refresh_mode = password_login_sessions[session_id].get('refresh_mode')
                     template_type = 'cookie_refresh_success' if notify_refresh_mode else 'password_login_success'
 
-                    # 获取模板
-                    template_data = db_manager.get_notification_template(template_type)
-                    if template_data and template_data.get('template'):
-                        template = template_data['template']
-                    else:
-                        if notify_refresh_mode:
-                            template = '''✅ 刷新Cookie成功
-
-账号: {account_id}
-时间: {time}
-Cookie数量: {cookie_count}
-
-账号已可正常使用。'''
-                        else:
-                            template = '''✅ 密码登录成功
-
-账号: {account_id}
-时间: {time}
-Cookie数量: {cookie_count}
-
-账号Cookie已更新，正在重启服务...'''
-
-                    # 格式化模板
-                    notification_message = template.replace('{account_id}', account_id)
-                    notification_message = notification_message.replace('{time}', time.strftime('%Y-%m-%d %H:%M:%S'))
-                    notification_message = notification_message.replace('{cookie_count}', str(len(cookies_dict)))
+                    notification_message = render_notification_template(
+                        template_type,
+                        account_id=account_id,
+                        time=time.strftime('%Y-%m-%d %H:%M:%S'),
+                        cookie_count=str(len(cookies_dict))
+                    )
 
                     login_type = "刷新Cookie" if notify_refresh_mode else "密码登录"
-                    notification_title = f"🎉 {login_type}成功"
-
-                    send_notification(account_id, notification_title, notification_message, "success")
-                    log_with_user('info', f"已发送{login_type}成功通知: {account_id}", current_user)
+                    notification_sent = dispatch_account_notifications_sync(
+                        account_id,
+                        notification_message,
+                        title=f"{login_type}成功",
+                        notification_type=template_type,
+                    )
+                    if notification_sent:
+                        log_with_user('info', f"已发送{login_type}成功通知: {account_id}", current_user)
+                    else:
+                        log_with_user('warning', f"{login_type}成功通知未发送成功: {account_id}", current_user)
                 except Exception as notify_err:
                     log_with_user('warning', f"发送登录成功通知失败: {account_id}, 错误: {str(notify_err)}", current_user)
                 
@@ -4351,7 +4298,7 @@ async def test_notification_template(data: TestNotificationIn, current_user: Dic
     from db_manager import db_manager
 
     try:
-        if data.template_type not in ['message', 'token_refresh', 'delivery', 'slider_success', 'face_verify', 'password_login_success', 'cookie_refresh_success']:
+        if data.template_type not in SUPPORTED_NOTIFICATION_TEMPLATE_TYPES:
             raise HTTPException(status_code=400, detail='无效的模板类型')
 
         # 获取所有已启用的通知渠道
@@ -4591,7 +4538,7 @@ def get_notification_template(template_type: str, current_user: Dict[str, Any] =
     """获取指定类型的通知模板"""
     from db_manager import db_manager
     try:
-        if template_type not in ['message', 'token_refresh', 'delivery', 'slider_success', 'face_verify', 'password_login_success', 'cookie_refresh_success']:
+        if template_type not in SUPPORTED_NOTIFICATION_TEMPLATE_TYPES:
             raise HTTPException(status_code=400, detail='无效的模板类型')
 
         template = db_manager.get_notification_template(template_type)
@@ -4620,7 +4567,7 @@ def update_notification_template(template_type: str, data: NotificationTemplateI
     """更新通知模板"""
     from db_manager import db_manager
     try:
-        if template_type not in ['message', 'token_refresh', 'delivery', 'slider_success', 'face_verify', 'password_login_success', 'cookie_refresh_success']:
+        if template_type not in SUPPORTED_NOTIFICATION_TEMPLATE_TYPES:
             raise HTTPException(status_code=400, detail='无效的模板类型')
 
         # 如果模板不存在，先插入默认值
@@ -4650,7 +4597,7 @@ def reset_notification_template(template_type: str, current_user: Dict[str, Any]
     """重置通知模板为默认值"""
     from db_manager import db_manager
     try:
-        if template_type not in ['message', 'token_refresh', 'delivery', 'slider_success', 'face_verify', 'password_login_success', 'cookie_refresh_success']:
+        if template_type not in SUPPORTED_NOTIFICATION_TEMPLATE_TYPES:
             raise HTTPException(status_code=400, detail='无效的模板类型')
 
         success = db_manager.reset_notification_template(template_type)
@@ -4671,7 +4618,7 @@ def get_default_notification_template(template_type: str, current_user: Dict[str
     """获取默认通知模板"""
     from db_manager import db_manager
     try:
-        if template_type not in ['message', 'token_refresh', 'delivery', 'slider_success', 'face_verify']:
+        if template_type not in SUPPORTED_NOTIFICATION_TEMPLATE_TYPES:
             raise HTTPException(status_code=400, detail='无效的模板类型')
 
         default_template = db_manager.get_default_notification_template(template_type)

@@ -28,6 +28,13 @@ import aiohttp
 from collections import defaultdict
 from typing import Any, Dict, Optional, Tuple
 from db_manager import db_manager
+from utils.notification_dispatcher import (
+    dispatch_account_notifications,
+    format_notification_template,
+    get_notification_template_text,
+    guess_verification_type,
+    render_notification_template,
+)
 
 
 DELIVERY_BATCH_MAX_UNITS = 10
@@ -1097,6 +1104,7 @@ class XianyuLive:
         self.notification_cooldown = 300  # 5分钟内不重复发送相同类型的通知
         self.token_refresh_notification_cooldown = 18000  # Token刷新异常通知冷却时间：3小时
         self.notification_lock = asyncio.Lock()  # 通知防重复机制的异步锁
+        self.pending_notification_keys = set()  # 记录发送中的通知，避免并发重复发送
 
         # 自动发货防重复机制
         self.last_delivery_time = {}  # 记录每个商品的最后发货时间
@@ -7121,86 +7129,15 @@ class XianyuLive:
 
     def _get_notification_template(self, template_type: str) -> str:
         """获取通知模板，如果没有自定义模板则返回默认模板"""
-        try:
-            from db_manager import db_manager
-            template_data = db_manager.get_notification_template(template_type)
-            if template_data and template_data.get('template'):
-                return template_data['template']
-        except Exception as e:
-            logger.warning(f"获取通知模板失败: {e}")
-
-        # 返回默认模板
-        default_templates = {
-            'message': '''🚨 接收消息通知
-
-账号: {account_id}
-买家: {buyer_name} (ID: {buyer_id})
-商品ID: {item_id}
-聊天ID: {chat_id}
-消息内容: {message}
-
-时间: {time}''',
-            'token_refresh': '''Token刷新异常
-
-账号ID: {account_id}
-异常时间: {time}
-异常信息: {error_message}
-
-请检查账号Cookie是否过期，如有需要请及时更新Cookie配置。''',
-            'delivery': '''🚨 自动发货通知
-
-账号: {account_id}
-买家: {buyer_name} (ID: {buyer_id})
-商品ID: {item_id}
-聊天ID: {chat_id}
-结果: {result}
-时间: {time}
-
-请及时处理！''',
-            'slider_success': '''✅ 滑块验证成功，cookies已自动更新到数据库
-
-账号: {account_id}
-时间: {time}''',
-            'face_verify': '''⚠️ 需要{verification_type}或登录出错 🚫
-在验证期间，发货及自动回复暂时无法使用。
-
-请点击验证链接完成验证:
-{verification_url}
-
-账号: {account_id}
-时间: {time}''',
-            'password_login_success': '''✅ 密码登录成功
-
-账号: {account_id}
-时间: {time}
-Cookie数量: {cookie_count}
-
-账号Cookie已更新，正在重启服务...''',
-            'cookie_refresh_success': '''✅ 刷新Cookie成功
-
-账号: {account_id}
-时间: {time}
-Cookie数量: {cookie_count}
-
-账号已可正常使用。'''
-        }
-        return default_templates.get(template_type, '')
+        return get_notification_template_text(template_type)
 
     def _format_template(self, template: str, **kwargs) -> str:
         """格式化模板，将变量替换为实际值"""
-        try:
-            for key, value in kwargs.items():
-                template = template.replace(f'{{{key}}}', str(value) if value is not None else '未知')
-            return template
-        except Exception as e:
-            logger.error(f"格式化模板失败: {e}")
-            return template
+        return format_notification_template(template, **kwargs)
 
     async def send_notification(self, send_user_name: str, send_user_id: str, send_message: str, item_id: str = None, chat_id: str = None):
         """发送消息通知"""
         try:
-            from db_manager import db_manager
-            import aiohttp
             import hashlib
 
             # 过滤系统默认消息，不发送通知
@@ -7217,6 +7154,7 @@ Cookie数量: {cookie_count}
             # 用于防重复发送
             notification_key = f"{chat_id or 'unknown'}_{send_user_id}_{send_message}"
             notification_hash = hashlib.md5(notification_key.encode('utf-8')).hexdigest()
+            reservation_key = f"msg:{notification_hash}"
             
             # 使用异步锁保护防重复检查，确保并发安全
             async with self.notification_lock:
@@ -7228,92 +7166,48 @@ Cookie数量: {cookie_count}
                         remaining_seconds = int(self.notification_cooldown - time_since_last)
                         logger.warning(f"📱 通知在冷却期内（剩余 {remaining_seconds} 秒），跳过重复发送 - 账号: {self.cookie_id}, 买家: {send_user_name}, 消息: {send_message[:30]}...")
                         return
-                
-                # 更新通知发送时间
-                self.last_notification_time[notification_hash] = current_time
-                
-                # 清理过期的通知记录（超过1小时的记录）
-                expired_keys = [
-                    key for key, timestamp in self.last_notification_time.items()
-                    if current_time - timestamp > 3600  # 1小时
-                ]
-                for key in expired_keys:
-                    del self.last_notification_time[key]
+                if reservation_key in self.pending_notification_keys:
+                    logger.warning(f"📱 相同消息通知正在发送中，跳过重复发送 - 账号: {self.cookie_id}, 买家: {send_user_name}")
+                    return
+                self.pending_notification_keys.add(reservation_key)
 
-            logger.info(f"📱 开始发送消息通知 - 账号: {self.cookie_id}, 买家: {send_user_name}")
+            try:
+                logger.info(f"📱 开始发送消息通知 - 账号: {self.cookie_id}, 买家: {send_user_name}")
 
-            # 获取当前账号的通知配置
-            notifications = db_manager.get_account_notifications(self.cookie_id)
+                notification_msg = render_notification_template(
+                    'message',
+                    account_id=self.cookie_id,
+                    buyer_name=send_user_name,
+                    buyer_id=send_user_id,
+                    item_id=item_id or '未知',
+                    chat_id=chat_id or '未知',
+                    message=send_message,
+                    time=time.strftime('%Y-%m-%d %H:%M:%S')
+                )
 
-            if not notifications:
-                logger.warning(f"📱 账号 {self.cookie_id} 未配置消息通知，跳过通知发送")
-                return
+                notification_sent = await dispatch_account_notifications(
+                    self.cookie_id,
+                    notification_msg,
+                    title='接收消息通知',
+                    notification_type='message',
+                )
 
-            logger.info(f"📱 找到 {len(notifications)} 个通知渠道配置")
+                if not notification_sent:
+                    logger.warning(f"📱 消息通知未发送成功，不进入冷却 - 账号: {self.cookie_id}, 买家: {send_user_name}")
+                    return
 
-            # 构建通知消息（使用模板）
-            template = self._get_notification_template('message')
-            notification_msg = self._format_template(
-                template,
-                account_id=self.cookie_id,
-                buyer_name=send_user_name,
-                buyer_id=send_user_id,
-                item_id=item_id or '未知',
-                chat_id=chat_id or '未知',
-                message=send_message,
-                time=time.strftime('%Y-%m-%d %H:%M:%S')
-            )
-
-            # 发送通知到各个渠道
-            for i, notification in enumerate(notifications, 1):
-                logger.info(f"📱 处理第 {i} 个通知渠道: {notification.get('channel_name', 'Unknown')}")
-
-                if not notification.get('enabled', True):
-                    logger.warning(f"📱 通知渠道 {notification.get('channel_name')} 已禁用，跳过")
-                    continue
-
-                channel_type = notification.get('channel_type')
-                channel_config = notification.get('channel_config')
-
-                logger.info(f"📱 渠道类型: {channel_type}, 配置: {channel_config}")
-
-                try:
-                    # 解析配置数据
-                    config_data = self._parse_notification_config(channel_config)
-                    logger.info(f"📱 解析后的配置数据: {config_data}")
-
-                    match channel_type:
-                        case 'qq':
-                            logger.info(f"📱 开始发送QQ通知...")
-                            await self._send_qq_notification(config_data, notification_msg)
-                        case 'ding_talk' | 'dingtalk':
-                            logger.info(f"📱 开始发送钉钉通知...")
-                            await self._send_dingtalk_notification(config_data, notification_msg)
-                        case 'feishu' | 'lark':
-                            logger.info(f"📱 开始发送飞书通知...")
-                            await self._send_feishu_notification(config_data, notification_msg)
-                        case 'bark':
-                            logger.info(f"📱 开始发送Bark通知...")
-                            await self._send_bark_notification(config_data, notification_msg)
-                        case 'email':
-                            logger.info(f"📱 开始发送邮件通知...")
-                            await self._send_email_notification(config_data, notification_msg)
-                        case 'webhook':
-                            logger.info(f"📱 开始发送Webhook通知...")
-                            await self._send_webhook_notification(config_data, notification_msg)
-                        case 'wechat':
-                            logger.info(f"📱 开始发送微信通知...")
-                            await self._send_wechat_notification(config_data, notification_msg)
-                        case 'telegram':
-                            logger.info(f"📱 开始发送Telegram通知...")
-                            await self._send_telegram_notification(config_data, notification_msg)
-                        case _:
-                            logger.warning(f"📱 不支持的通知渠道类型: {channel_type}")
-
-                except Exception as notify_error:
-                    logger.error(f"📱 发送通知失败 ({notification.get('channel_name', 'Unknown')}): {self._safe_str(notify_error)}")
-                    import traceback
-                    logger.error(f"📱 详细错误信息: {traceback.format_exc()}")
+                async with self.notification_lock:
+                    sent_time = time.time()
+                    self.last_notification_time[notification_hash] = sent_time
+                    expired_keys = [
+                        key for key, timestamp in self.last_notification_time.items()
+                        if sent_time - timestamp > 3600
+                    ]
+                    for key in expired_keys:
+                        del self.last_notification_time[key]
+            finally:
+                async with self.notification_lock:
+                    self.pending_notification_keys.discard(reservation_key)
 
         except Exception as e:
             logger.error(f"📱 处理消息通知失败: {self._safe_str(e)}")
@@ -7868,13 +7762,11 @@ Cookie数量: {cookie_count}
         """
         try:
             # 检查是否是正常的令牌过期，这种情况不需要发送通知
-            if self._is_normal_token_expiry(error_message):
+            if notification_type != "token_scheduled_refresh_failed" and self._is_normal_token_expiry(error_message):
                 logger.warning(f"检测到正常的令牌过期，跳过通知: {error_message}")
                 return
 
-            # 检查是否在冷却期内
-            current_time = time.time()
-            last_time = self.last_notification_time.get(notification_type, 0)
+            notification_key = f"token:{notification_type}"
 
             # 为Token刷新异常通知使用特殊的3小时冷却时间
             # 基于错误消息内容判断是否为Token相关异常
@@ -7885,94 +7777,70 @@ Cookie数量: {cookie_count}
                 cooldown_time = self.notification_cooldown
                 cooldown_desc = f"{self.notification_cooldown // 60}分钟"
 
-            if current_time - last_time < cooldown_time:
-                remaining_time = cooldown_time - (current_time - last_time)
-                remaining_hours = int(remaining_time // 3600)
-                remaining_minutes = int((remaining_time % 3600) // 60)
-                remaining_seconds = int(remaining_time % 60)
+            async with self.notification_lock:
+                current_time = time.time()
+                last_time = self.last_notification_time.get(notification_key, 0)
+                if notification_key in self.pending_notification_keys:
+                    logger.warning(f"Token刷新通知正在发送中，跳过重复发送: {notification_type}")
+                    return
+                if current_time - last_time < cooldown_time:
+                    remaining_time = cooldown_time - (current_time - last_time)
+                    remaining_hours = int(remaining_time // 3600)
+                    remaining_minutes = int((remaining_time % 3600) // 60)
+                    remaining_seconds = int(remaining_time % 60)
 
-                if remaining_hours > 0:
-                    time_desc = f"{remaining_hours}小时{remaining_minutes}分钟"
-                elif remaining_minutes > 0:
-                    time_desc = f"{remaining_minutes}分钟{remaining_seconds}秒"
-                else:
-                    time_desc = f"{remaining_seconds}秒"
+                    if remaining_hours > 0:
+                        time_desc = f"{remaining_hours}小时{remaining_minutes}分钟"
+                    elif remaining_minutes > 0:
+                        time_desc = f"{remaining_minutes}分钟{remaining_seconds}秒"
+                    else:
+                        time_desc = f"{remaining_seconds}秒"
 
-                logger.warning(f"Token刷新通知在冷却期内，跳过发送: {notification_type} (还需等待 {time_desc})")
-                return
-
-            from db_manager import db_manager
-
-            # 获取当前账号的通知配置
-            notifications = db_manager.get_account_notifications(self.cookie_id)
-
-            if not notifications:
-                logger.warning("未配置消息通知，跳过Token刷新通知")
-                return
+                    logger.warning(f"Token刷新通知在冷却期内，跳过发送: {notification_type} (还需等待 {time_desc})")
+                    return
+                self.pending_notification_keys.add(notification_key)
 
             # 构造通知消息（使用模板）
             # 判断异常信息中是否包含"滑块验证成功"
             if "滑块验证成功" in error_message:
-                # 滑块验证成功使用专用模板
-                template = self._get_notification_template('slider_success')
-                notification_msg = self._format_template(
-                    template,
+                notification_msg = render_notification_template(
+                    'slider_success',
                     account_id=self.cookie_id,
                     time=time.strftime('%Y-%m-%d %H:%M:%S')
                 )
             elif "密码登录成功" in error_message or notification_type == "password_login_success":
-                # 密码登录成功使用专用模板
-                template = self._get_notification_template('password_login_success')
-                notification_msg = self._format_template(
-                    template,
+                notification_msg = render_notification_template(
+                    'password_login_success',
                     account_id=self.cookie_id,
                     time=time.strftime('%Y-%m-%d %H:%M:%S'),
                     cookie_count='已获取'
                 )
             elif "刷新Cookie成功" in error_message or notification_type == "cookie_refresh_success":
-                # 自动刷新Cookie成功使用专用模板
-                template = self._get_notification_template('cookie_refresh_success')
-                notification_msg = self._format_template(
-                    template,
+                notification_msg = render_notification_template(
+                    'cookie_refresh_success',
                     account_id=self.cookie_id,
                     time=time.strftime('%Y-%m-%d %H:%M:%S'),
                     cookie_count='已获取'
                 )
             elif "人脸验证" in error_message or "短信验证" in error_message or "二维码验证" in error_message or "身份验证" in error_message or (verification_url and "passport" in verification_url):
-                # 验证类型（人脸/短信/二维码/身份验证）使用专用模板
-                # 根据消息内容判断验证类型
-                if "人脸验证" in error_message:
-                    verify_type = "人脸验证"
-                elif "短信验证" in error_message:
-                    verify_type = "短信验证"
-                elif "二维码验证" in error_message:
-                    verify_type = "二维码验证"
-                else:
-                    verify_type = "身份验证"
-
-                template = self._get_notification_template('face_verify')
-                notification_msg = self._format_template(
-                    template,
+                notification_msg = render_notification_template(
+                    'face_verify',
                     account_id=self.cookie_id,
                     time=time.strftime('%Y-%m-%d %H:%M:%S'),
                     verification_url=verification_url or '无',
-                    verification_type=verify_type
+                    verification_type=guess_verification_type(error_message, verification_url)
                 )
             elif verification_url:
-                # 如果有验证链接，使用模板并添加验证链接
-                template = self._get_notification_template('token_refresh')
-                notification_msg = self._format_template(
-                    template,
+                notification_msg = render_notification_template(
+                    'token_refresh',
                     account_id=self.cookie_id,
                     time=time.strftime('%Y-%m-%d %H:%M:%S'),
                     error_message=error_message,
                     verification_url=verification_url
                 )
             else:
-                # 使用模板
-                template = self._get_notification_template('token_refresh')
-                notification_msg = self._format_template(
-                    template,
+                notification_msg = render_notification_template(
+                    'token_refresh',
                     account_id=self.cookie_id,
                     time=time.strftime('%Y-%m-%d %H:%M:%S'),
                     error_message=error_message,
@@ -7981,50 +7849,19 @@ Cookie数量: {cookie_count}
 
             logger.info(f"准备发送Token刷新异常通知: {self.cookie_id}")
 
-            # 发送通知到各个渠道
-            notification_sent = False
-            for notification in notifications:
-                if not notification.get('enabled', True):
-                    continue
-
-                channel_type = notification.get('channel_type')
-                channel_config = notification.get('channel_config')
-
-                try:
-                    # 解析配置数据
-                    config_data = self._parse_notification_config(channel_config)
-                    channel_sent = False
-
-                    match channel_type:
-                        case 'qq':
-                            channel_sent = await self._send_qq_notification(config_data, notification_msg)
-                        case 'ding_talk' | 'dingtalk':
-                            channel_sent = await self._send_dingtalk_notification(config_data, notification_msg)
-                        case 'feishu' | 'lark':
-                            channel_sent = await self._send_feishu_notification(config_data, notification_msg)
-                        case 'bark':
-                            channel_sent = await self._send_bark_notification(config_data, notification_msg)
-                        case 'email':
-                            # 邮件支持附件
-                            channel_sent = await self._send_email_notification(config_data, notification_msg, attachment_path)
-                        case 'webhook':
-                            channel_sent = await self._send_webhook_notification(config_data, notification_msg)
-                        case 'wechat':
-                            channel_sent = await self._send_wechat_notification(config_data, notification_msg)
-                        case 'telegram':
-                            channel_sent = await self._send_telegram_notification(config_data, notification_msg)
-                        case _:
-                            logger.warning(f"不支持的通知渠道类型: {channel_type}")
-
-                    if channel_sent:
-                        notification_sent = True
-
-                except Exception as notify_error:
-                    logger.error(f"发送Token刷新通知失败 ({notification.get('channel_name', 'Unknown')}): {self._safe_str(notify_error)}")
+            notification_sent = await dispatch_account_notifications(
+                self.cookie_id,
+                notification_msg,
+                title='闲鱼管理系统通知',
+                notification_type=notification_type,
+                attachment_path=attachment_path,
+            )
 
             # 如果成功发送了通知，更新最后发送时间
             if notification_sent:
-                self.last_notification_time[notification_type] = current_time
+                current_time = time.time()
+                async with self.notification_lock:
+                    self.last_notification_time[notification_key] = current_time
 
                 # 根据错误消息内容使用不同的冷却时间
                 if self._is_token_related_error(error_message):
@@ -8036,9 +7873,14 @@ Cookie数量: {cookie_count}
 
                 next_send_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(next_send_time))
                 logger.info(f"Token刷新通知已发送，下次可发送时间: {next_send_time_str} (冷却时间: {cooldown_desc})")
+            else:
+                logger.warning(f"【{self.cookie_id}】Token刷新通知未发送成功，不进入冷却: {notification_type}")
 
         except Exception as e:
             logger.error(f"处理Token刷新通知失败: {self._safe_str(e)}")
+        finally:
+            async with self.notification_lock:
+                self.pending_notification_keys.discard(f"token:{notification_type}")
 
     def _is_normal_token_expiry(self, error_message: str) -> bool:
         """检查是否是正常的令牌过期或其他不需要通知的情况"""
@@ -8115,19 +7957,8 @@ Cookie数量: {cookie_count}
     async def send_delivery_failure_notification(self, send_user_name: str, send_user_id: str, item_id: str, error_message: str, chat_id: str = None):
         """发送自动发货失败通知"""
         try:
-            from db_manager import db_manager
-
-            # 获取当前账号的通知配置
-            notifications = db_manager.get_account_notifications(self.cookie_id)
-
-            if not notifications:
-                logger.warning("未配置消息通知，跳过自动发货通知")
-                return
-
-            # 构造通知消息（使用模板）
-            template = self._get_notification_template('delivery')
-            notification_message = self._format_template(
-                template,
+            notification_message = render_notification_template(
+                'delivery',
                 account_id=self.cookie_id,
                 buyer_name=send_user_name,
                 buyer_id=send_user_id,
@@ -8137,46 +7968,14 @@ Cookie数量: {cookie_count}
                 time=time.strftime('%Y-%m-%d %H:%M:%S')
             )
 
-            # 发送通知到所有已启用的通知渠道
-            for notification in notifications:
-                if notification.get('enabled', False):
-                    channel_type = notification.get('channel_type', 'qq')
-                    channel_config = notification.get('channel_config', '')
-
-                    try:
-                        # 解析配置数据
-                        config_data = self._parse_notification_config(channel_config)
-
-                        match channel_type:
-                            case 'qq':
-                                await self._send_qq_notification(config_data, notification_message)
-                                logger.info(f"已发送自动发货通知到QQ")
-                            case 'ding_talk' | 'dingtalk':
-                                await self._send_dingtalk_notification(config_data, notification_message)
-                                logger.info(f"已发送自动发货通知到钉钉")
-                            case 'email':
-                                await self._send_email_notification(config_data, notification_message)
-                                logger.info(f"已发送自动发货通知到邮箱")
-                            case 'webhook':
-                                await self._send_webhook_notification(config_data, notification_message)
-                                logger.info(f"已发送自动发货通知到Webhook")
-                            case 'wechat':
-                                await self._send_wechat_notification(config_data, notification_message)
-                                logger.info(f"已发送自动发货通知到微信")
-                            case 'telegram':
-                                await self._send_telegram_notification(config_data, notification_message)
-                                logger.info(f"已发送自动发货通知到Telegram")
-                            case 'bark':
-                                await self._send_bark_notification(config_data, notification_message)
-                                logger.info(f"已发送自动发货通知到Bark")
-                            case 'feishu' | 'lark':
-                                await self._send_feishu_notification(config_data, notification_message)
-                                logger.info(f"已发送自动发货通知到飞书")
-                            case _:
-                                logger.warning(f"不支持的通知渠道类型: {channel_type}")
-
-                    except Exception as notify_error:
-                        logger.error(f"发送自动发货通知失败: {self._safe_str(notify_error)}")
+            notification_sent = await dispatch_account_notifications(
+                self.cookie_id,
+                notification_message,
+                title='自动发货通知',
+                notification_type='delivery',
+            )
+            if not notification_sent:
+                logger.warning(f"【{self.cookie_id}】自动发货通知未发送成功")
 
         except Exception as e:
             logger.error(f"发送自动发货通知异常: {self._safe_str(e)}")
