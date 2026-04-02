@@ -5625,6 +5625,7 @@ const templatePreviewData = {
     face_verify: {
         account_id: 'test_account',
         time: new Date().toLocaleString('zh-CN'),
+        verification_action: '请点击验证链接完成验证:',
         verification_url: 'https://passport.goofish.com/mini_login.htm?example=test',
         verification_type: '人脸验证'
     },

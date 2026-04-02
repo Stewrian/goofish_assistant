@@ -59,10 +59,10 @@ DEFAULT_NOTIFICATION_TEMPLATES = {
 
 账号: {account_id}
 时间: {time}''',
-    'face_verify': '''⚠️ 需要{verification_type}或登录出错 🚫
+    'face_verify': '''⚠️ 需要{verification_type} 🚫
 在验证期间，发货及自动回复暂时无法使用。
 
-请点击验证链接完成验证:
+{verification_action}
 {verification_url}
 
 账号: {account_id}
@@ -200,19 +200,18 @@ def build_face_verify_notification(
     )
 
     if has_screenshot:
-        return (
-            f"⚠️ 需要{verification_type_label} 🚫\n"
-            f"在验证期间，发货及自动回复暂时无法使用。\n\n"
-            f"请在自动化网站的账号管理弹窗中扫描二维码完成验证。\n\n"
-            f"账号: {account_id}\n"
-            f"时间: {time_text}"
-        )
+        verification_action = '请在自动化网站的账号管理弹窗中扫描二维码完成验证:'
+        verification_target = '自动化网站账号管理弹窗中的验证二维码'
+    else:
+        verification_action = '请点击验证链接完成验证:'
+        verification_target = verification_url or '无'
 
     return render_notification_template(
         'face_verify',
         account_id=account_id,
         time=time_text,
-        verification_url=verification_url or '无',
+        verification_action=verification_action,
+        verification_url=verification_target,
         verification_type=verification_type_label,
     )
 

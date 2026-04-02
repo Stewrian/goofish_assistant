@@ -2622,8 +2622,6 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     message,
                     verification_url,
                 )
-                if actual_screenshot_path:
-                    verification_type_label = '人脸验证'
                 
                 # 优先使用截图路径，如果没有截图则使用验证链接
                 if actual_screenshot_path and os.path.exists(actual_screenshot_path):
@@ -4360,6 +4358,7 @@ async def test_notification_template(data: TestNotificationIn, current_user: Dic
             'face_verify': {
                 'account_id': '测试账号',
                 'time': time_module.strftime('%Y-%m-%d %H:%M:%S'),
+                'verification_action': '请点击验证链接完成验证:',
                 'verification_url': 'https://passport.goofish.com/mini_login.htm?example=test',
                 'verification_type': '人脸验证'
             },

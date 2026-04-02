@@ -856,10 +856,10 @@ class DBManager:
 
 账号: {account_id}
 时间: {time}'),
-            ('face_verify', '⚠️ 需要{verification_type}或登录出错 🚫
+            ('face_verify', '⚠️ 需要{verification_type} 🚫
 在验证期间，发货及自动回复暂时无法使用。
 
-请点击验证链接完成验证:
+{verification_action}
 {verification_url}
 
 账号: {account_id}
@@ -1099,10 +1099,10 @@ Cookie数量: {cookie_count}
 
 账号: {account_id}
 时间: {time}'),
-                ('face_verify', '⚠️ 需要{verification_type}或登录出错 🚫
+                ('face_verify', '⚠️ 需要{verification_type} 🚫
 在验证期间，发货及自动回复暂时无法使用。
 
-请点击验证链接完成验证:
+{verification_action}
 {verification_url}
 
 账号: {account_id}
@@ -3469,10 +3469,10 @@ Cookie数量: {cookie_count}
 
 账号: {account_id}
 时间: {time}''',
-            'face_verify': '''⚠️ 需要{verification_type}或登录出错 🚫
+            'face_verify': '''⚠️ 需要{verification_type} 🚫
 在验证期间，发货及自动回复暂时无法使用。
 
-请点击验证链接完成验证:
+{verification_action}
 {verification_url}
 
 账号: {account_id}
@@ -3532,10 +3532,10 @@ Cookie数量: {cookie_count}
 
 账号: {account_id}
 时间: {time}''',
-            'face_verify': '''⚠️ 需要{verification_type}或登录出错 🚫
+            'face_verify': '''⚠️ 需要{verification_type} 🚫
 在验证期间，发货及自动回复暂时无法使用。
 
-请点击验证链接完成验证:
+{verification_action}
 {verification_url}
 
 账号: {account_id}
