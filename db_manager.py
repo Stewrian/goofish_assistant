@@ -6592,14 +6592,21 @@ Cookie数量: {cookie_count}
                 return [], []
 
     # 已知的无效 buyer_id 占位值
-    _INVALID_BUYER_IDS = {"unknown_user", "unknown", "", "None", "null"}
+    _INVALID_BUYER_IDS = {"unknown_user", "unknown", "", "None", "null", "0", "-", "-1"}
 
     @staticmethod
     def _is_valid_buyer_id(buyer_id) -> bool:
         """检查 buyer_id 是否为有效值（非占位符）"""
         if not buyer_id:
             return False
-        return str(buyer_id).strip() not in DBManager._INVALID_BUYER_IDS
+        normalized_buyer_id = str(buyer_id).strip()
+        if normalized_buyer_id.endswith('@goofish'):
+            normalized_buyer_id = normalized_buyer_id.split('@')[0].strip()
+        if normalized_buyer_id in DBManager._INVALID_BUYER_IDS:
+            return False
+        if normalized_buyer_id.isdigit() and len(normalized_buyer_id) <= 2:
+            return False
+        return True
 
     def insert_or_update_order(self, order_id: str, item_id: str = None, buyer_id: str = None,
                               spec_name: str = None, spec_value: str = None, quantity: str = None,

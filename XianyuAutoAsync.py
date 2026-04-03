@@ -1666,19 +1666,143 @@ class XianyuLive:
         return bool(db_manager.get_item_info(self.cookie_id, item_id))
 
     # 已知的无效 buyer_id 占位值
-    _INVALID_BUYER_IDS = {"unknown_user", "unknown", "", "None", "null"}
+    _INVALID_BUYER_IDS = {"unknown_user", "unknown", "", "None", "null", "0", "-", "-1"}
+
+    @classmethod
+    def _normalize_buyer_id_value(cls, buyer_id) -> Optional[str]:
+        if buyer_id is None:
+            return None
+        text = str(buyer_id).strip()
+        if not text:
+            return None
+        if text.endswith('@goofish'):
+            text = text.split('@')[0].strip()
+        return text or None
 
     @staticmethod
     def _is_trustworthy_buyer_id(buyer_id) -> bool:
         """判断 buyer_id 是否可信，用于防串单校验。
         不可信的值（占位符等）不应参与一致性比对。"""
-        if not buyer_id:
+        normalized_buyer_id = XianyuLive._normalize_buyer_id_value(buyer_id)
+        if not normalized_buyer_id:
             return False
-        return str(buyer_id).strip() not in XianyuLive._INVALID_BUYER_IDS
+        if normalized_buyer_id in XianyuLive._INVALID_BUYER_IDS:
+            return False
+        if normalized_buyer_id.isdigit() and len(normalized_buyer_id) <= 2:
+            return False
+        return True
+
+    def _extract_query_value_from_url(self, url_text: Any, key: str) -> Optional[str]:
+        text = str(url_text or '').strip()
+        if not text:
+            return None
+
+        try:
+            parsed = urlparse(text)
+            query = parse_qs(parsed.query or '')
+            value = query.get(key, [None])[0]
+            return self._normalize_buyer_id_value(value)
+        except Exception as e:
+            logger.debug(f"【{self.cookie_id}】解析链接参数失败: key={key}, error={self._safe_str(e)}")
+            return None
+
+    def _extract_buyer_id_from_message_meta(self, message_meta: dict, *, meta_label: str,
+                                            log_prefix: str = "") -> Tuple[Optional[str], Optional[str]]:
+        if not isinstance(message_meta, dict):
+            return None, None
+
+        biz_tag_dict = self._load_json_dict(message_meta.get('bizTag', ''))
+        candidates = [
+            ('reminderUrl.peerUserId', self._extract_query_value_from_url(message_meta.get('reminderUrl'), 'peerUserId')),
+            ('bizTag.senderId', self._normalize_buyer_id_value(biz_tag_dict.get('senderId') or biz_tag_dict.get('sender_id'))),
+            (f'{meta_label}.senderUserId', self._normalize_buyer_id_value(message_meta.get('senderUserId'))),
+        ]
+
+        low_trust_candidates = []
+        for source, candidate in candidates:
+            if not candidate:
+                continue
+            if self._is_trustworthy_buyer_id(candidate):
+                return candidate, source
+            low_trust_candidates.append(f'{source}={candidate}')
+
+        if low_trust_candidates:
+            logger.info(
+                f"{log_prefix} 👤 检测到低可信买家ID候选，已忽略: {', '.join(low_trust_candidates[:3])}"
+            )
+        return None, None
+
+    def _select_buyer_identity_for_order_write(self, order_id: str, *, incoming_buyer_id: Any = None,
+                                               incoming_buyer_nick: Any = None, existing_order: Dict[str, Any] = None,
+                                               buyer_id_source: str = None, buyer_nick_source: str = 'unknown',
+                                               log_prefix: str = '') -> Tuple[Optional[str], Optional[str], bool]:
+        incoming_buyer_id = self._normalize_buyer_id_value(incoming_buyer_id)
+        incoming_buyer_nick = self._sanitize_buyer_nick(
+            incoming_buyer_nick,
+            source=buyer_nick_source,
+            log_prefix=log_prefix,
+        )
+
+        existing_buyer_id = self._normalize_buyer_id_value((existing_order or {}).get('buyer_id'))
+        existing_buyer_nick = (existing_order or {}).get('buyer_nick')
+        existing_buyer_is_trustworthy = self._is_trustworthy_buyer_id(existing_buyer_id)
+        incoming_buyer_is_trustworthy = self._is_trustworthy_buyer_id(incoming_buyer_id)
+        source_label = buyer_id_source or 'unknown'
+
+        if incoming_buyer_id and incoming_buyer_id == self.myid:
+            if existing_order:
+                preserved_buyer_id = existing_buyer_id if existing_buyer_id and existing_buyer_id != self.myid else None
+                if existing_buyer_nick:
+                    incoming_buyer_nick = existing_buyer_nick
+                logger.info(
+                    f"{log_prefix} 订单 {order_id} 命中自己买家ID保护，继续刷新并保留已有买家信息: "
+                    f"incoming_buyer_id={incoming_buyer_id}, preserved_buyer_id={preserved_buyer_id}"
+                )
+                return preserved_buyer_id, incoming_buyer_nick, False
+
+            logger.info(
+                f"{log_prefix} 跳过疑似买家订单 {order_id} 的首次写入，buyer_id={incoming_buyer_id} 等于自己的ID"
+            )
+            return None, incoming_buyer_nick, True
+
+        if existing_buyer_is_trustworthy:
+            if not incoming_buyer_id:
+                return existing_buyer_id, incoming_buyer_nick or existing_buyer_nick, False
+
+            if not incoming_buyer_is_trustworthy:
+                logger.info(
+                    f"{log_prefix} 忽略低可信buyer_id覆盖，保留已有买家信息: "
+                    f"order_id={order_id}, incoming_buyer_id={incoming_buyer_id}, "
+                    f"incoming_source={source_label}, preserved_buyer_id={existing_buyer_id}"
+                )
+                return existing_buyer_id, incoming_buyer_nick or existing_buyer_nick, False
+
+            if incoming_buyer_id != existing_buyer_id:
+                logger.warning(
+                    f"{log_prefix} 检测到买家ID冲突，保留已有可信买家信息: "
+                    f"order_id={order_id}, incoming_buyer_id={incoming_buyer_id}, "
+                    f"incoming_source={source_label}, preserved_buyer_id={existing_buyer_id}"
+                )
+                return existing_buyer_id, incoming_buyer_nick or existing_buyer_nick, False
+
+            return existing_buyer_id, incoming_buyer_nick or existing_buyer_nick, False
+
+        if incoming_buyer_is_trustworthy:
+            return incoming_buyer_id, incoming_buyer_nick or existing_buyer_nick, False
+
+        if incoming_buyer_id:
+            logger.info(
+                f"{log_prefix} 检测到低可信buyer_id，暂不写入订单: "
+                f"order_id={order_id}, incoming_buyer_id={incoming_buyer_id}, incoming_source={source_label}"
+            )
+
+        fallback_buyer_id = existing_buyer_id if existing_buyer_id and existing_buyer_id != self.myid else None
+        return fallback_buyer_id, incoming_buyer_nick or existing_buyer_nick, False
 
     def _extract_order_message_context(self, message: dict, msg_id: str = None) -> Dict[str, Any]:
         """从订单相关消息中提取买家、会话和商品信息。"""
         buyer_id = None
+        buyer_id_source = None
         buyer_nick = None
         sid = ""
         item_id = None
@@ -1697,7 +1821,11 @@ class XianyuLive:
                 # 尝试从 message['4'] 提取 buyer_id（PNM 等格式的 senderUserId 在这里）
                 message_4 = message.get("4")
                 if isinstance(message_4, dict):
-                    buyer_id = message_4.get("senderUserId") or None
+                    buyer_id, buyer_id_source = self._extract_buyer_id_from_message_meta(
+                        message_4,
+                        meta_label='message[4]',
+                        log_prefix=log_prefix,
+                    )
                     buyer_nick = self._sanitize_buyer_nick(
                         message_4.get("senderNick"),
                         source="senderNick(msg4)",
@@ -1716,11 +1844,18 @@ class XianyuLive:
                             logger.info(f"{log_prefix} 👤 从message[4].reminderTitle提取到买家昵称: {buyer_nick}")
                     if buyer_nick:
                         logger.info(f"{log_prefix} 👤 从message[4]提取到买家昵称: {buyer_nick}")
-                logger.info(f"{log_prefix} 📌 简化消息，sid: {sid}，buyer_id: {buyer_id}")
+                logger.info(
+                    f"{log_prefix} 📌 简化消息，sid: {sid}，buyer_id: {buyer_id}，"
+                    f"buyer_id_source: {buyer_id_source or '-'}"
+                )
             elif isinstance(message_1, dict):
                 if "10" in message_1 and isinstance(message_1["10"], dict):
                     message_10 = message_1["10"]
-                    buyer_id = message_10.get("senderUserId") or None
+                    buyer_id, buyer_id_source = self._extract_buyer_id_from_message_meta(
+                        message_10,
+                        meta_label='message[1][10]',
+                        log_prefix=log_prefix,
+                    )
                     buyer_nick = self._sanitize_buyer_nick(
                         message_10.get("senderNick"),
                         source="senderNick",
@@ -1764,39 +1899,29 @@ class XianyuLive:
 
         return {
             'buyer_id': buyer_id,
+            'buyer_id_source': buyer_id_source,
             'buyer_nick': buyer_nick,
             'sid': sid,
             'item_id': item_id,
         }
 
     def _preload_basic_order_info(self, order_id: str, item_id: str = None, buyer_id: str = None,
-                                  sid: str = None, buyer_nick: str = None) -> bool:
+                                  sid: str = None, buyer_nick: str = None,
+                                  buyer_id_source: str = None) -> bool:
         """在详情抓取前先落基础订单，避免详情超时导致整单丢失。"""
         try:
             existing_order = db_manager.get_order_by_id(order_id)
-            buyer_id_to_save = buyer_id
-            buyer_nick_to_save = self._sanitize_buyer_nick(
-                buyer_nick,
-                source="preload",
-                log_prefix=f"【{self.cookie_id}】"
+            buyer_id_to_save, buyer_nick_to_save, should_skip_write = self._select_buyer_identity_for_order_write(
+                order_id,
+                incoming_buyer_id=buyer_id,
+                incoming_buyer_nick=buyer_nick,
+                existing_order=existing_order,
+                buyer_id_source=buyer_id_source,
+                buyer_nick_source="preload",
+                log_prefix=f"【{self.cookie_id}】",
             )
-
-            if buyer_id and buyer_id == self.myid:
-                if existing_order:
-                    existing_buyer_id = (existing_order.get('buyer_id') or '').strip()
-                    existing_buyer_nick = existing_order.get('buyer_nick')
-                    buyer_id_to_save = existing_buyer_id if existing_buyer_id and existing_buyer_id != self.myid else None
-                    if existing_buyer_nick:
-                        buyer_nick_to_save = existing_buyer_nick
-                    logger.info(
-                        f"【{self.cookie_id}】基础订单命中自己买家ID保护，保留已有买家信息: "
-                        f"order_id={order_id}, preserved_buyer_id={buyer_id_to_save}"
-                    )
-                else:
-                    logger.info(
-                        f"【{self.cookie_id}】跳过疑似买家订单 {order_id} 的基础预入库，buyer_id={buyer_id} 等于自己的ID"
-                    )
-                    return False
+            if should_skip_write:
+                return False
 
             success = db_manager.insert_or_update_order(
                 order_id=order_id,
@@ -1821,7 +1946,8 @@ class XianyuLive:
             return False
 
     async def _retry_order_detail_after_delay(self, order_id: str, item_id: str = None, buyer_id: str = None,
-                                              sid: str = None, buyer_nick: str = None, delay_seconds: int = 30):
+                                              sid: str = None, buyer_nick: str = None, delay_seconds: int = 30,
+                                              buyer_id_source: str = None):
         """订单详情首次抓取失败后，后台延迟补抓一次。"""
         current_task = asyncio.current_task()
         try:
@@ -1833,6 +1959,7 @@ class XianyuLive:
                 buyer_id,
                 sid=sid,
                 buyer_nick=buyer_nick,
+                buyer_id_source=buyer_id_source,
                 force_refresh=True
             )
             if result:
@@ -1850,7 +1977,8 @@ class XianyuLive:
                 self.order_detail_retry_tasks.pop(order_id, None)
 
     def _schedule_order_detail_retry(self, order_id: str, item_id: str = None, buyer_id: str = None,
-                                     sid: str = None, buyer_nick: str = None, delay_seconds: int = 30):
+                                     sid: str = None, buyer_nick: str = None, delay_seconds: int = 30,
+                                     buyer_id_source: str = None):
         """调度订单详情补抓任务，避免同一订单重复创建补抓。"""
         existing_task = self.order_detail_retry_tasks.get(order_id)
         if existing_task and not existing_task.done():
@@ -1864,7 +1992,8 @@ class XianyuLive:
                 buyer_id=buyer_id,
                 sid=sid,
                 buyer_nick=buyer_nick,
-                delay_seconds=delay_seconds
+                delay_seconds=delay_seconds,
+                buyer_id_source=buyer_id_source,
             )
         )
         self.order_detail_retry_tasks[order_id] = task
@@ -8238,7 +8367,7 @@ class XianyuLive:
             logger.error(f"【{self.cookie_id}】免拼发货模块调用失败: {self._safe_str(e)}")
             return {"error": f"免拼发货模块调用失败: {self._safe_str(e)}", "order_id": order_id}
 
-    async def fetch_order_detail_info(self, order_id: str, item_id: str = None, buyer_id: str = None, debug_headless: bool = None, sid: str = None, force_refresh: bool = False, buyer_nick: str = None):
+    async def fetch_order_detail_info(self, order_id: str, item_id: str = None, buyer_id: str = None, debug_headless: bool = None, sid: str = None, force_refresh: bool = False, buyer_nick: str = None, buyer_id_source: str = None):
         """获取订单详情信息（使用独立的锁机制，不受延迟锁影响）
 
         Args:
@@ -8476,12 +8605,6 @@ class XianyuLive:
 
                         normalized_current_order_status = db_manager._normalize_order_status(current_order_status)
                         normalized_incoming_order_status = db_manager._normalize_order_status(order_status)
-                        buyer_id_to_save = buyer_id
-                        buyer_nick_to_save = self._sanitize_buyer_nick(
-                            buyer_nick,
-                            source="order_detail",
-                            log_prefix=f"【{self.cookie_id}】"
-                        )
                         if self._should_accept_order_detail_status_correction(
                             current_order_status,
                             order_status,
@@ -8511,29 +8634,17 @@ class XianyuLive:
                                 f"order_id={order_id}, current={current_order_status}, incoming={order_status}"
                             )
 
-                        if buyer_id and buyer_id == self.myid:
-                            if existing_order:
-                                existing_buyer_id = (existing_order.get('buyer_id') or '').strip()
-                                existing_buyer_nick = existing_order.get('buyer_nick')
-
-                                if existing_buyer_id and existing_buyer_id != self.myid:
-                                    buyer_id_to_save = existing_buyer_id
-                                else:
-                                    # 避免把自己ID覆盖为买家ID
-                                    buyer_id_to_save = None
-
-                                if existing_buyer_nick:
-                                    buyer_nick_to_save = existing_buyer_nick
-
-                                logger.info(
-                                    f"【{self.cookie_id}】订单 {order_id} 命中自己买家ID保护，继续刷新并保留已有买家信息: "
-                                    f"incoming_buyer_id={buyer_id}, preserved_buyer_id={buyer_id_to_save}"
-                                )
-                            else:
-                                logger.info(
-                                    f"【{self.cookie_id}】跳过疑似买家订单 {order_id} 首次落库，buyer_id={buyer_id} 等于自己的ID"
-                                )
-                                return result  # 新订单且买家是自己时仍跳过，避免误入库
+                        buyer_id_to_save, buyer_nick_to_save, should_skip_write = self._select_buyer_identity_for_order_write(
+                            order_id,
+                            incoming_buyer_id=buyer_id,
+                            incoming_buyer_nick=buyer_nick,
+                            existing_order=existing_order,
+                            buyer_id_source=buyer_id_source,
+                            buyer_nick_source="order_detail",
+                            log_prefix=f"【{self.cookie_id}】",
+                        )
+                        if should_skip_write:
+                            return result
 
                         # 检查cookie_id是否在cookies表中存在
                         cookie_info = db_manager.get_cookie_by_id(self.cookie_id)
@@ -12433,6 +12544,7 @@ class XianyuLive:
 
                     order_context = self._extract_order_message_context(message, msg_id=msg_id)
                     temp_user_id = order_context.get('buyer_id')
+                    temp_user_id_source = order_context.get('buyer_id_source')
                     temp_item_id = order_context.get('item_id')
                     temp_sid = order_context.get('sid')
                     temp_buyer_nick = order_context.get('buyer_nick')
@@ -12464,13 +12576,21 @@ class XianyuLive:
                         item_id=temp_item_id,
                         buyer_id=temp_user_id,
                         sid=temp_sid,
-                        buyer_nick=temp_buyer_nick
+                        buyer_nick=temp_buyer_nick,
+                        buyer_id_source=temp_user_id_source,
                     )
 
                     # 立即获取订单详情信息
                     try:
                         # 调用订单详情获取方法（传入sid和buyer_nick用于保存到数据库）
-                        order_detail = await self.fetch_order_detail_info(order_id, temp_item_id, temp_user_id, sid=temp_sid, buyer_nick=temp_buyer_nick)
+                        order_detail = await self.fetch_order_detail_info(
+                            order_id,
+                            temp_item_id,
+                            temp_user_id,
+                            sid=temp_sid,
+                            buyer_nick=temp_buyer_nick,
+                            buyer_id_source=temp_user_id_source,
+                        )
                         if order_detail:
                             logger.info(f'[{msg_time}] 【{self.cookie_id}】✅ 订单详情获取成功: {order_id}')
                         else:
@@ -12482,7 +12602,8 @@ class XianyuLive:
                                     buyer_id=temp_user_id,
                                     sid=temp_sid,
                                     buyer_nick=temp_buyer_nick,
-                                    delay_seconds=30
+                                    delay_seconds=30,
+                                    buyer_id_source=temp_user_id_source,
                                 )
 
                     except Exception as detail_e:
@@ -12494,7 +12615,8 @@ class XianyuLive:
                                 buyer_id=temp_user_id,
                                 sid=temp_sid,
                                 buyer_nick=temp_buyer_nick,
-                                delay_seconds=30
+                                delay_seconds=30,
+                                buyer_id_source=temp_user_id_source,
                             )
                 else:
                     logger.warning(f"【{self.cookie_id}】[{msg_id}] 未检测到订单ID")
