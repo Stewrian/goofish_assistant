@@ -5915,6 +5915,8 @@ class XianyuLive:
             # 在单独的线程中运行同步的登录方法
             import asyncio
             slider = XianyuSliderStealth(user_id=self.cookie_id, enable_learning=False, headless=not show_browser)
+            slider.risk_session_id = risk_session_id
+            slider.risk_trigger_scene = trigger_scene
             result = await asyncio.to_thread(
                 slider.login_with_password_playwright,
                 account=username,
@@ -10054,16 +10056,29 @@ class XianyuLive:
                             break
                         else:
                             # 根据上一次刷新状态决定日志级别（冷却/已重启为正常情况）
-                            if getattr(self, 'last_token_refresh_status', None) in ("skipped_cooldown", "restarted_after_cookie_refresh"):
-                                logger.info(f"【{self.cookie_id}】Token刷新未执行或已重启（正常），将在{self.token_retry_interval // 60}分钟后重试")
+                            last_refresh_status = getattr(self, 'last_token_refresh_status', None)
+                            benign_refresh_statuses = ("skipped_cooldown", "restarted_after_cookie_refresh")
+
+                            if last_refresh_status in benign_refresh_statuses:
+                                logger.info(
+                                    f"【{self.cookie_id}】Token刷新未执行或已重启（正常），将在{self.token_retry_interval // 60}分钟后重试"
+                                )
+                                logger.info(
+                                    f"【{self.cookie_id}】本次定时Token刷新属于正常跳过场景，"
+                                    f"status={last_refresh_status}，不发送异常通知"
+                                )
                             else:
                                 logger.error(f"【{self.cookie_id}】Token刷新失败，将在{self.token_retry_interval // 60}分钟后重试")
 
                             # 清空当前token，确保下次重试时重新获取
                             self.current_token = None
 
-                            # 发送Token刷新失败通知
-                            await self.send_token_refresh_notification("Token定时刷新失败，将自动重试", "token_scheduled_refresh_failed")
+                            # 仅真正失败时发送Token刷新失败通知，避免消息冷却/已重启场景误报
+                            if last_refresh_status not in benign_refresh_statuses:
+                                await self.send_token_refresh_notification(
+                                    "Token定时刷新失败，将自动重试",
+                                    "token_scheduled_refresh_failed"
+                                )
                             await self._interruptible_sleep(self.token_retry_interval)
                             continue
                     await self._interruptible_sleep(60)

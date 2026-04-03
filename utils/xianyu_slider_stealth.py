@@ -877,6 +877,114 @@ class XianyuSliderStealth:
             payload.update({key: value for key, value in extra.items() if value is not None})
         return payload or None
 
+    def _resolve_slider_risk_context(self) -> Tuple[str, str]:
+        trigger_scene = getattr(self, 'risk_trigger_scene', None)
+        if not trigger_scene:
+            trigger_scene = 'manual_password_refresh' if getattr(self, '_slider_refresh_mode', False) else 'password_login'
+
+        if trigger_scene == 'manual_password_refresh':
+            flow_label = '手动刷新Cookie'
+        elif trigger_scene == 'password_login':
+            flow_label = '账号密码登录'
+        elif trigger_scene == 'auto_cookie_refresh':
+            flow_label = '自动Cookie刷新'
+        else:
+            flow_label = '密码登录流程'
+
+        return trigger_scene, flow_label
+
+    def _start_password_login_slider_risk_log(self, verification_url: str = None,
+                                              detection_phase: str = None) -> Optional[Dict[str, Any]]:
+        try:
+            from db_manager import db_manager
+
+            trigger_scene, flow_label = self._resolve_slider_risk_context()
+            event_meta = self._build_risk_event_meta(
+                verification_url=verification_url,
+                extra={
+                    'account_id': self.pure_user_id,
+                    'source': 'password_login_flow',
+                    'refresh_mode': bool(getattr(self, '_slider_refresh_mode', False)),
+                    'detection_phase': detection_phase,
+                },
+            )
+            log_id = db_manager.add_risk_control_log(
+                cookie_id=self.pure_user_id,
+                event_type='slider_captcha',
+                session_id=getattr(self, 'risk_session_id', None),
+                trigger_scene=trigger_scene,
+                result_code='password_login_slider_detected',
+                event_description=f'{flow_label}检测到滑块验证',
+                event_meta=event_meta,
+                processing_status='processing',
+                error_message='检测到滑块验证，正在自动处理',
+            )
+            if log_id:
+                logger.info(f"【{self.pure_user_id}】已记录密码登录滑块风控日志: {log_id}")
+                return {
+                    'log_id': log_id,
+                    'started_at': time.time(),
+                    'verification_url': verification_url,
+                    'event_meta': event_meta,
+                    'trigger_scene': trigger_scene,
+                    'flow_label': flow_label,
+                }
+        except Exception as log_err:
+            logger.warning(f"【{self.pure_user_id}】记录密码登录滑块风控日志失败: {log_err}")
+        return None
+
+    def _finish_password_login_slider_risk_log(self, slider_risk_log: Optional[Dict[str, Any]], *,
+                                               success: bool, verification_url: str = None,
+                                               processing_result: str = None, error_message: str = None,
+                                               extra_meta: Optional[Dict[str, Any]] = None):
+        if not slider_risk_log or not slider_risk_log.get('log_id'):
+            return
+
+        try:
+            from db_manager import db_manager
+
+            trigger_scene = slider_risk_log.get('trigger_scene') or self._resolve_slider_risk_context()[0]
+            flow_label = slider_risk_log.get('flow_label') or self._resolve_slider_risk_context()[1]
+            final_verification_url = verification_url or slider_risk_log.get('verification_url')
+            merged_event_meta = dict(slider_risk_log.get('event_meta') or {})
+            if isinstance(extra_meta, dict):
+                merged_event_meta.update({key: value for key, value in extra_meta.items() if value is not None})
+
+            final_event_meta = self._build_risk_event_meta(
+                verification_url=final_verification_url,
+                extra=merged_event_meta,
+            )
+
+            result_code = 'password_login_slider_success' if success else 'password_login_slider_failed'
+            if success:
+                final_processing_result = processing_result or f'{flow_label}中的滑块验证成功'
+                final_error_message = None
+                event_description = f'{flow_label}中的滑块验证已自动处理成功'
+            else:
+                final_processing_result = processing_result or f'{flow_label}中的滑块验证失败'
+                final_error_message = error_message or '滑块验证失败，请稍后重试'
+                event_description = f'{flow_label}中的滑块验证自动处理失败'
+
+            duration_ms = None
+            started_at = slider_risk_log.get('started_at')
+            if started_at:
+                duration_ms = max(0, int((time.time() - float(started_at)) * 1000))
+
+            db_manager.update_risk_control_log(
+                log_id=slider_risk_log['log_id'],
+                event_description=event_description,
+                processing_result=final_processing_result,
+                processing_status='success' if success else 'failed',
+                error_message=final_error_message,
+                session_id=getattr(self, 'risk_session_id', None),
+                trigger_scene=trigger_scene,
+                result_code=result_code,
+                event_meta=final_event_meta,
+                duration_ms=duration_ms,
+            )
+        except Exception as log_err:
+            logger.warning(f"【{self.pure_user_id}】更新密码登录滑块风控日志失败: {log_err}")
+
     def _get_slider_failure_message(self, default_message: str) -> str:
         feedback = self.last_verification_feedback or {}
         feedback_message = str(feedback.get("message") or "").strip()
@@ -5355,9 +5463,20 @@ class XianyuSliderStealth:
                                 
                                 # 检测到滑块验证，立即处理
                                 logger.warning(f"【{self.pure_user_id}】检测到滑块验证，开始自动处理...")
+                                slider_risk_log = self._start_password_login_slider_risk_log(
+                                    verification_url=frame.url if hasattr(frame, 'url') else getattr(page, 'url', None),
+                                    detection_phase='verification_probe',
+                                )
                                 slider_success = self.solve_slider(max_retries=3)
                                 if slider_success:
                                     logger.success(f"【{self.pure_user_id}】✅ 滑块验证成功！")
+                                    self._finish_password_login_slider_risk_log(
+                                        slider_risk_log,
+                                        success=True,
+                                        verification_url=frame.url if hasattr(frame, 'url') else getattr(page, 'url', None),
+                                        processing_result='密码登录流程中的滑块验证自动处理成功',
+                                        extra_meta={'detection_source': '_detect_qr_code_verification'},
+                                    )
                                     time.sleep(3)  # 等待滑块验证后的状态更新
                                 else:
                                     # 3次失败后，刷新页面重试
@@ -5369,11 +5488,32 @@ class XianyuSliderStealth:
                                         slider_success = self.solve_slider(max_retries=3)
                                         if not slider_success:
                                             logger.error(f"【{self.pure_user_id}】❌ 刷新后滑块验证仍然失败")
+                                            self._finish_password_login_slider_risk_log(
+                                                slider_risk_log,
+                                                success=False,
+                                                verification_url=frame.url if hasattr(frame, 'url') else getattr(page, 'url', None),
+                                                error_message=self._get_slider_failure_message('滑块验证失败，请稍后重试'),
+                                                extra_meta={'detection_source': '_detect_qr_code_verification'},
+                                            )
                                         else:
                                             logger.success(f"【{self.pure_user_id}】✅ 刷新后滑块验证成功！")
+                                            self._finish_password_login_slider_risk_log(
+                                                slider_risk_log,
+                                                success=True,
+                                                verification_url=frame.url if hasattr(frame, 'url') else getattr(page, 'url', None),
+                                                processing_result='密码登录流程中的滑块验证自动处理成功（刷新后）',
+                                                extra_meta={'detection_source': '_detect_qr_code_verification'},
+                                            )
                                             time.sleep(3)
                                     except Exception as e:
                                         logger.error(f"【{self.pure_user_id}】❌ 页面刷新失败: {e}")
+                                        self._finish_password_login_slider_risk_log(
+                                            slider_risk_log,
+                                            success=False,
+                                            verification_url=frame.url if hasattr(frame, 'url') else getattr(page, 'url', None),
+                                            error_message=f'页面刷新失败: {str(e)}',
+                                            extra_meta={'detection_source': '_detect_qr_code_verification'},
+                                        )
                                 
                                 # 清理临时变量
                                 if hasattr(self, '_detected_slider_frame'):
@@ -6177,6 +6317,10 @@ class XianyuSliderStealth:
                                 logger.info(f"【{self.pure_user_id}】干净上下文检测到前置风控滑块，尝试自动处理...")
 
                             logger.warning(f"【{self.pure_user_id}】检测到滑块验证，开始处理...")
+                            slider_risk_log = self._start_password_login_slider_risk_log(
+                                verification_url=(detected_slider_frame.url if detected_slider_frame and hasattr(detected_slider_frame, 'url') else getattr(page, 'url', None)),
+                                detection_phase='pre_login_monitor',
+                            )
                             time.sleep(3)
                             slider_success = self.solve_slider(max_retries=3)
                             
@@ -6184,6 +6328,13 @@ class XianyuSliderStealth:
                                 feedback = self.last_verification_feedback or {}
                                 if feedback.get("source") == "slider_missing":
                                     logger.error(f"【{self.pure_user_id}】❌ 滑块流程结束后页面已不再包含滑块，停止额外刷新重试")
+                                    self._finish_password_login_slider_risk_log(
+                                        slider_risk_log,
+                                        success=False,
+                                        verification_url=(detected_slider_frame.url if detected_slider_frame and hasattr(detected_slider_frame, 'url') else getattr(page, 'url', None)),
+                                        error_message=self._get_slider_failure_message("页面状态已变化，未找到滑块容器，请重新尝试刷新Cookie"),
+                                        extra_meta={'detection_source': 'login_with_password_playwright_pre_login'},
+                                    )
                                     return self._fail_login(self._get_slider_failure_message("页面状态已变化，未找到滑块容器，请重新尝试刷新Cookie"))
 
                                 # 3次失败后，刷新页面重试
@@ -6198,14 +6349,35 @@ class XianyuSliderStealth:
                                         if feedback.get("source") == "slider_missing":
                                             logger.error(f"【{self.pure_user_id}】❌ 刷新后页面未出现滑块，停止重复尝试")
                                         logger.error(f"【{self.pure_user_id}】❌ 刷新后滑块验证仍然失败")
+                                        self._finish_password_login_slider_risk_log(
+                                            slider_risk_log,
+                                            success=False,
+                                            verification_url=(detected_slider_frame.url if detected_slider_frame and hasattr(detected_slider_frame, 'url') else getattr(page, 'url', None)),
+                                            error_message=self._get_slider_failure_message("滑块验证失败，请稍后重试"),
+                                            extra_meta={'detection_source': 'login_with_password_playwright_pre_login'},
+                                        )
                                         return self._fail_login(self._get_slider_failure_message("滑块验证失败，请稍后重试"))
                                     else:
                                         logger.success(f"【{self.pure_user_id}】✅ 刷新后滑块验证成功！")
                                 except Exception as e:
                                     logger.error(f"【{self.pure_user_id}】❌ 页面刷新失败: {e}")
+                                    self._finish_password_login_slider_risk_log(
+                                        slider_risk_log,
+                                        success=False,
+                                        verification_url=(detected_slider_frame.url if detected_slider_frame and hasattr(detected_slider_frame, 'url') else getattr(page, 'url', None)),
+                                        error_message=f"页面会话已失效: {str(e)}",
+                                        extra_meta={'detection_source': 'login_with_password_playwright_pre_login'},
+                                    )
                                     return self._fail_login("页面会话已失效，请重新尝试刷新Cookie")
                             else:
                                 logger.success(f"【{self.pure_user_id}】✅ 滑块验证成功！")
+                            self._finish_password_login_slider_risk_log(
+                                slider_risk_log,
+                                success=True,
+                                verification_url=(detected_slider_frame.url if detected_slider_frame and hasattr(detected_slider_frame, 'url') else getattr(page, 'url', None)),
+                                processing_result='密码登录流程中的滑块验证自动处理成功',
+                                extra_meta={'detection_source': 'login_with_password_playwright_pre_login'},
+                            )
                             
                             # 等待页面加载和状态更新（第一次等待3秒）
                             logger.info(f"【{self.pure_user_id}】等待3秒，让页面加载完成...")
@@ -6435,14 +6607,32 @@ class XianyuSliderStealth:
                     
                     if has_slider:
                         logger.warning(f"【{self.pure_user_id}】检测到滑块验证，开始处理...")
+                        slider_risk_log = self._start_password_login_slider_risk_log(
+                            verification_url=(getattr(search_frame, 'url', None) if 'search_frame' in locals() else getattr(page, 'url', None)),
+                            detection_phase='post_login_monitor',
+                        )
 
                         # 【复用】直接调用 solve_slider() 方法处理滑块
                         slider_success = self.solve_slider(max_retries=3)
 
                         if slider_success:
                             logger.success(f"【{self.pure_user_id}】✅ 滑块验证成功！")
+                            self._finish_password_login_slider_risk_log(
+                                slider_risk_log,
+                                success=True,
+                                verification_url=(getattr(search_frame, 'url', None) if 'search_frame' in locals() else getattr(page, 'url', None)),
+                                processing_result='密码登录流程中的滑块验证自动处理成功',
+                                extra_meta={'detection_source': 'login_with_password_playwright_post_login'},
+                            )
                         else:
                             logger.error(f"【{self.pure_user_id}】❌ 滑块验证3次均失败")
+                            self._finish_password_login_slider_risk_log(
+                                slider_risk_log,
+                                success=False,
+                                verification_url=(getattr(search_frame, 'url', None) if 'search_frame' in locals() else getattr(page, 'url', None)),
+                                error_message=self._get_slider_failure_message("滑块验证失败，请稍后重试"),
+                                extra_meta={'detection_source': 'login_with_password_playwright_post_login'},
+                            )
                             return self._fail_login(self._get_slider_failure_message("滑块验证失败，请稍后重试"))
                     else:
                         logger.info(f"【{self.pure_user_id}】未检测到滑块验证")
@@ -6470,12 +6660,30 @@ class XianyuSliderStealth:
 
                     if has_slider_after_wait:
                         logger.warning(f"【{self.pure_user_id}】检测到滑块验证，开始处理...")
+                        wait_slider_risk_log = self._start_password_login_slider_risk_log(
+                            verification_url=getattr(active_page or page, 'url', None),
+                            detection_phase='post_wait_monitor',
+                        )
                         slider_success = self.solve_slider(max_retries=3)
                         if slider_success:
                             logger.success(f"【{self.pure_user_id}】✅ 滑块验证成功！")
+                            self._finish_password_login_slider_risk_log(
+                                wait_slider_risk_log,
+                                success=True,
+                                verification_url=getattr(active_page or page, 'url', None),
+                                processing_result='密码登录流程中的滑块验证自动处理成功（等待后）',
+                                extra_meta={'detection_source': 'login_with_password_playwright_post_wait'},
+                            )
                             time.sleep(3)  # 等待滑块验证后的状态更新
                         else:
                             logger.error(f"【{self.pure_user_id}】❌ 滑块验证3次均失败")
+                            self._finish_password_login_slider_risk_log(
+                                wait_slider_risk_log,
+                                success=False,
+                                verification_url=getattr(active_page or page, 'url', None),
+                                error_message=self._get_slider_failure_message("滑块验证失败，请稍后重试"),
+                                extra_meta={'detection_source': 'login_with_password_playwright_post_wait'},
+                            )
                             return self._fail_login(self._get_slider_failure_message("滑块验证失败，请稍后重试"))
                     
                     # 检查登录状态
