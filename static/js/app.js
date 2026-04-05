@@ -15975,9 +15975,19 @@ function clearIgnoredUpdateVersion(showFeedback = true) {
 
 // 本地版本历史（远程服务禁用时使用）
 const LOCAL_VERSION_HISTORY = {
-    version: 'v1.8.3',
+    version: 'v1.8.4',
     intro: '本系统仅供个人学习研究使用，请勿用于商业用途。如有问题或建议，欢迎反馈。',
     versionHistory: [
+        {
+            version: 'v1.8.4',
+            date: '2026-04-05',
+            updates: [
+                '【修复】修复订单详情规格解析失败导致自动发货被阻断的问题（by @82762294）',
+                '【优化】滑块验证统计新增当日 / 7天 / 所有范围筛选，统计卡片文案与交互更清晰',
+                '【优化】风控日志“处理结果”展示简化，移除前端元数据展开信息，排查更直观',
+                '【优化】账号管理入口与说明文案更新，明确扫码登录、账密登录、手动刷新 Cookie 与导入 Cookie 的使用场景'
+            ]
+        },
         {
             version: 'v1.8.3',
             date: '2026-04-05',
