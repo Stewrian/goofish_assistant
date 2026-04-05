@@ -14711,6 +14711,30 @@ let currentRiskLogOffset = 0;
 const riskLogLimit = 100;
 let currentRiskSliderStatsRequestId = 0;
 
+function getRiskSliderStatsRange() {
+    const activeButton = document.querySelector('#riskSliderRangeFilter .risk-slider-range-btn.is-active');
+    return activeButton?.dataset.range || 'all';
+}
+
+function getRiskSliderStatsRangeLabel(rangeValue = 'all') {
+    switch (String(rangeValue || '').trim().toLowerCase()) {
+        case 'today':
+            return '当日';
+        case '7d':
+            return '近 7 天';
+        default:
+            return '所有';
+    }
+}
+
+function onRiskSliderRangeChange(rangeValue = 'all') {
+    document.querySelectorAll('#riskSliderRangeFilter .risk-slider-range-btn').forEach((button) => {
+        button.classList.toggle('is-active', button.dataset.range === rangeValue);
+    });
+    const cookieId = document.getElementById('riskLogCookieFilter')?.value || '';
+    loadRiskControlSliderStats(cookieId);
+}
+
 function setRiskControlSliderStatsLoading(scopeLabel = '全部账号') {
     const scopeElement = document.getElementById('riskSliderScope');
     const successRateElement = document.getElementById('riskSliderSuccessRate');
@@ -14747,10 +14771,15 @@ function renderRiskControlSliderStats(stats = {}) {
     const hasData = Boolean(stats.has_data || totalSessions > 0);
     const recentSuccessText = formatBeijingDateTime(stats.recent_success);
     const recentFailureText = formatBeijingDateTime(stats.recent_failure);
+    const rangeLabel = stats.range_label || getRiskSliderStatsRangeLabel(stats.selected_range || getRiskSliderStatsRange());
     let attemptSummary = stats.summary_text || '暂无滑块验证记录';
 
     if (hasData) {
-        attemptSummary = `累计滑块相关记录 ${totalSessions} 次`;
+        if (rangeLabel === '所有') {
+            attemptSummary = `累计滑块相关记录 ${totalSessions} 次`;
+        } else {
+            attemptSummary = `${rangeLabel}滑块相关记录 ${totalSessions} 次`;
+        }
         if (processingCount > 0) {
             attemptSummary += `，进行中 ${processingCount} 次`;
         }
@@ -14768,15 +14797,19 @@ function renderRiskControlSliderStats(stats = {}) {
 async function loadRiskControlSliderStats(cookieId = '') {
     const token = localStorage.getItem('auth_token');
     const scopeLabel = cookieId || '全部账号';
+    const rangeValue = getRiskSliderStatsRange();
+    const rangeLabel = getRiskSliderStatsRangeLabel(rangeValue);
     const requestId = ++currentRiskSliderStatsRequestId;
 
     setRiskControlSliderStatsLoading(scopeLabel);
 
     try {
-        let url = '/admin/slider-verification-stats';
+        const params = new URLSearchParams();
         if (cookieId) {
-            url += `?cookie_id=${encodeURIComponent(cookieId)}`;
+            params.set('cookie_id', cookieId);
         }
+        params.set('range_key', rangeValue);
+        const url = `/admin/slider-verification-stats?${params.toString()}`;
 
         const response = await fetch(url, {
             headers: {
@@ -14804,7 +14837,9 @@ async function loadRiskControlSliderStats(cookieId = '') {
             success_rate: 0,
             recent_success: '--',
             recent_failure: '--',
-            summary_text: '暂无滑块验证记录',
+            summary_text: rangeValue === 'all' ? '暂无滑块验证记录' : `${rangeLabel}暂无滑块验证记录`,
+            selected_range: rangeValue,
+            range_label: rangeLabel,
             has_data: false
         });
     } catch (error) {
@@ -14822,7 +14857,9 @@ async function loadRiskControlSliderStats(cookieId = '') {
             success_rate: 0,
             recent_success: '--',
             recent_failure: '--',
-            summary_text: '暂无滑块验证记录',
+            summary_text: rangeValue === 'all' ? '暂无滑块验证记录' : `${rangeLabel}暂无滑块验证记录`,
+            selected_range: rangeValue,
+            range_label: rangeLabel,
             has_data: false
         });
     }
@@ -15076,37 +15113,6 @@ function formatRiskSessionId(sessionId, sessionDisplay = '') {
     return fallback || '--';
 }
 
-function normalizeRiskEventMeta(eventMeta) {
-    if (!eventMeta) {
-        return null;
-    }
-    if (typeof eventMeta === 'string') {
-        try {
-            return JSON.parse(eventMeta);
-        } catch (error) {
-            return { raw: eventMeta };
-        }
-    }
-    if (typeof eventMeta === 'object') {
-        return eventMeta;
-    }
-    return { raw: String(eventMeta) };
-}
-
-function renderRiskLogMetaDetails(eventMeta) {
-    const normalizedMeta = normalizeRiskEventMeta(eventMeta);
-    if (!normalizedMeta) {
-        return '';
-    }
-    const prettyJson = JSON.stringify(normalizedMeta, null, 2);
-    return `
-        <details class="mt-2">
-            <summary class="small text-muted">查看元数据</summary>
-            <pre class="small mb-0 mt-2">${escapeHtml(prettyJson)}</pre>
-        </details>
-    `;
-}
-
 function renderRiskLogSummaryCell(log) {
     const descriptionText = log.event_description_display || log.event_description || '-';
     const description = escapeHtml(descriptionText);
@@ -15136,7 +15142,6 @@ function renderRiskLogOutcomeCell(log) {
             ${processingResult}
             ${errorMessage}
             ${fallbackText}
-            ${renderRiskLogMetaDetails(log.event_meta)}
         </div>
     `;
 }

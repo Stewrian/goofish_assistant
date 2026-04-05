@@ -2104,11 +2104,17 @@
                     </div>
                     <div>
                       <div class="risk-tool-card-kicker">滑块验证统计</div>
-                      <h6 class="mb-1">当前系统用户会话表现</h6>
-                      <p class="text-muted mb-0 small">统计滑块成功/失败，并将账密刷新中的滑块失败计入失败次数</p>
+                      <h6 class="mb-1">当前范围统计</h6>
                     </div>
                   </div>
-                  <span class="risk-tool-chip risk-slider-scope" id="riskSliderScope">全部账号</span>
+                  <div class="d-flex align-items-center gap-2 flex-wrap">
+                    <div class="risk-slider-range-group" id="riskSliderRangeFilter" role="group" aria-label="滑块统计时间范围">
+                      <button type="button" class="risk-slider-range-btn" data-range="today" onclick="onRiskSliderRangeChange('today')">当日</button>
+                      <button type="button" class="risk-slider-range-btn" data-range="7d" onclick="onRiskSliderRangeChange('7d')">7天</button>
+                      <button type="button" class="risk-slider-range-btn is-active" data-range="all" onclick="onRiskSliderRangeChange('all')">所有</button>
+                    </div>
+                    <span class="risk-tool-chip risk-slider-scope" id="riskSliderScope">全部账号</span>
+                  </div>
                 </div>
 
                 <div class="risk-slider-hero">
@@ -2121,22 +2127,22 @@
 
                 <div class="risk-slider-stats-grid">
                   <div class="risk-slider-stat-chip success">
-                    <span>成功会话</span>
+                    <span>成功次数</span>
                     <strong id="riskSliderSuccessCount">0</strong>
                   </div>
                   <div class="risk-slider-stat-chip danger">
-                    <span>失败会话</span>
+                    <span>失败次数</span>
                     <strong id="riskSliderFailureCount">0</strong>
                   </div>
                 </div>
 
                 <div class="risk-slider-stats-foot">
                   <div class="risk-slider-foot-item">
-                      <span>最近成功会话</span>
+                      <span>最近成功时间</span>
                     <strong id="riskSliderRecentSuccess">--</strong>
                   </div>
                   <div class="risk-slider-foot-item">
-                      <span>最近失败会话</span>
+                      <span>最近失败时间</span>
                     <strong id="riskSliderRecentFailure">--</strong>
                   </div>
                 </div>
@@ -2264,7 +2270,7 @@
                       <th>触发场景</th>
                       <th>状态</th>
                       <th>摘要</th>
-                      <th>结果 / 错误</th>
+                      <th>处理结果</th>
                       <th>耗时</th>
                       <th>链路ID</th>
                       <th>操作</th>
