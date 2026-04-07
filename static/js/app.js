@@ -12,6 +12,8 @@ let dashboardData = {
     totalKeywords: 0
 };
 let pendingAccountManagementFocusId = '';
+let aboutDiagnosticsAccounts = [];
+let aboutDiagnosticsInitialized = false;
 
 // 账号关键词缓存
 let accountKeywordCache = {};
@@ -1235,6 +1237,18 @@ const beijingMinuteFormatter = new Intl.DateTimeFormat('zh-CN', {
     hourCycle: 'h23'
 });
 
+const beijingSecondFormatter = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+    hourCycle: 'h23'
+});
+
 function formatBeijingDateTime(dateString) {
     const date = parseUtcDateTime(dateString);
     if (!date) return '--';
@@ -1247,6 +1261,44 @@ function formatBeijingDateTime(dateString) {
     });
 
     return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
+}
+
+function formatBeijingDateTimeWithSeconds(dateInput) {
+    const date = parseUtcDateTime(dateInput);
+    if (!date) return '--';
+
+    const parts = {};
+    beijingSecondFormatter.formatToParts(date).forEach(part => {
+        if (part.type !== 'literal') {
+            parts[part.type] = part.value;
+        }
+    });
+
+    return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
+}
+
+function formatAboutRuntimeTime(displayValue, rawTimestamp) {
+    const displayText = typeof displayValue === 'string' ? displayValue.trim() : '';
+    if (displayText) {
+        if (/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}$/.test(displayText)) {
+            return displayText.replace('T', ' ');
+        }
+
+        const normalizedDisplay = formatBeijingDateTimeWithSeconds(displayText);
+        if (normalizedDisplay !== '--') {
+            return normalizedDisplay;
+        }
+
+        return displayText;
+    }
+
+    const numericTimestamp = Number(rawTimestamp);
+    if (!Number.isFinite(numericTimestamp) || numericTimestamp <= 0) {
+        return '暂无记录';
+    }
+
+    const millis = numericTimestamp > 1e12 ? numericTimestamp : numericTimestamp * 1000;
+    return formatBeijingDateTimeWithSeconds(new Date(millis));
 }
 
 function isTodayOrder(createdAt) {
@@ -2701,6 +2753,631 @@ async function fetchJSON(url, opts = {}) {
 }
 
 // ================================
+// 账号保活诊断
+// ================================
+
+function getAboutDiagnosticsElements() {
+    return {
+        accountSelect: document.getElementById('aboutDiagnosticsAccount'),
+        accountMeta: document.getElementById('aboutDiagnosticsAccountMeta'),
+        refreshButton: document.getElementById('aboutDiagnosticsRefreshBtn'),
+        keepaliveButton: document.getElementById('aboutDiagnosticsKeepaliveBtn'),
+        historyButton: document.getElementById('aboutDiagnosticsHistoryBtn'),
+        conversationInput: document.getElementById('aboutDiagnosticsConversationId'),
+        statusContainer: document.getElementById('aboutDiagnosticsStatus'),
+        historyContainer: document.getElementById('aboutConversationHistory'),
+    };
+}
+
+function getAboutSelectedAccountId() {
+    return document.getElementById('aboutDiagnosticsAccount')?.value?.trim() || '';
+}
+
+function getAboutStatusText(type, value) {
+    const normalized = String(value || '').trim();
+    if (!normalized) {
+        return '暂无';
+    }
+
+    const maps = {
+        connection: {
+            connected: '已连接',
+            reconnecting: '重连中',
+            connecting: '连接中',
+            disconnected: '未连接',
+            failed: '失败',
+            closed: '已关闭',
+            not_running: '未运行',
+            unknown: '未知',
+        },
+        keepalive: {
+            started: '执行中',
+            success: '成功',
+            auth_failed: '鉴权失败',
+            api_failed: '接口失败',
+            network_failed: '网络异常',
+            response_parse_failed: '响应解析失败',
+            exception: '执行异常',
+        },
+        token: {
+            started: '执行中',
+            success: '成功',
+            skipped_cooldown: '冷却跳过',
+            restarted_after_cookie_refresh: '已触发重连',
+            captcha_max_retries_exceeded: '滑块重试超限',
+            token_missing_after_refresh: '刷新后无 Token',
+            token_missing: '无 Token',
+            failed: '失败',
+        },
+    };
+
+    return maps[type]?.[normalized] || normalized;
+}
+
+function getAboutStatusVariant(type, value) {
+    const normalized = String(value || '').trim();
+    if (!normalized) {
+        return 'secondary';
+    }
+
+    if (type === 'connection') {
+        if (normalized === 'connected') return 'success';
+        if (normalized === 'connecting' || normalized === 'reconnecting') return 'warning';
+        if (normalized === 'failed') return 'danger';
+        if (normalized === 'not_running' || normalized === 'disconnected' || normalized === 'closed') return 'secondary';
+        return 'info';
+    }
+
+    if (normalized === 'success') return 'success';
+    if (normalized === 'started' || normalized === 'connecting' || normalized === 'reconnecting') return 'info';
+    if (normalized.includes('failed') || normalized.includes('exception') || normalized.includes('error')) return 'danger';
+    if (normalized.includes('skipped') || normalized.includes('retry') || normalized.includes('restarted')) return 'warning';
+    return 'secondary';
+}
+
+function buildAboutStatusBadge(type, value) {
+    const text = getAboutStatusText(type, value);
+    const variant = getAboutStatusVariant(type, value);
+    return `<span class="about-status-badge is-${variant}">${escapeHtml(text)}</span>`;
+}
+
+function buildAboutMetaCard({ label, value, supporting = '' }) {
+    return `
+        <div class="account-diagnostics-summary-item">
+            <div class="account-diagnostics-summary-label">${escapeHtml(label)}</div>
+            <div class="account-diagnostics-summary-value">${escapeHtml(value)}</div>
+            ${supporting ? `<div class="account-diagnostics-summary-support">${escapeHtml(supporting)}</div>` : ''}
+        </div>
+    `;
+}
+
+function buildAboutRuntimeStatusItem({ label, value, note = '', tone = '', richValue = false, accent = '', icon = '' }) {
+    return `
+        <div class="account-diagnostics-status-item ${tone ? `is-${tone}` : ''} ${accent ? `is-${accent}` : ''}">
+            <div class="account-diagnostics-status-item-head">
+                <div class="account-diagnostics-status-item-icon">
+                    ${icon ? `<i class="bi bi-${icon}"></i>` : ''}
+                </div>
+                <div class="account-diagnostics-status-item-label">${escapeHtml(label)}</div>
+            </div>
+            <div class="account-diagnostics-status-item-value">${richValue ? value : escapeHtml(value)}</div>
+            ${note ? `<div class="account-diagnostics-status-item-note">${escapeHtml(note)}</div>` : ''}
+        </div>
+    `;
+}
+
+function buildAboutRuntimeMetaItem(label, value) {
+    return `
+        <div class="account-diagnostics-status-meta-item">
+            <span class="account-diagnostics-status-meta-label">${escapeHtml(label)}</span>
+            <span class="account-diagnostics-status-meta-value">${escapeHtml(value)}</span>
+        </div>
+    `;
+}
+
+function buildAboutReadinessValue(items) {
+    return `
+        <div class="account-diagnostics-readiness-list">
+            ${items.map(item => `
+                <span class="account-diagnostics-readiness-chip ${item.ready ? 'is-ready' : 'is-pending'}">
+                    <span class="account-diagnostics-readiness-name-wrap">
+                        <span class="account-diagnostics-readiness-dot"></span>
+                        <span class="account-diagnostics-readiness-name">${escapeHtml(item.label)}</span>
+                    </span>
+                    <span class="account-diagnostics-readiness-state">${item.ready ? '已就绪' : '未就绪'}</span>
+                </span>
+            `).join('')}
+        </div>
+    `;
+}
+
+function renderAboutAccountMeta(account) {
+    const { accountMeta } = getAboutDiagnosticsElements();
+    if (!accountMeta) return;
+
+    if (!account) {
+        accountMeta.innerHTML = '';
+        return;
+    }
+
+    const metaParts = [
+        buildAboutMetaCard({
+            label: '账号 ID',
+            value: account.id,
+        }),
+        buildAboutMetaCard({
+            label: '登录名',
+            value: account.username || '未设置用户名',
+            supporting: account.username ? '用于账号识别与后续 Cookie 刷新' : '建议补充用户名，便于后续维护',
+        }),
+        buildAboutMetaCard({
+            label: '备注',
+            value: account.remark || '未设置备注',
+            supporting: account.remark ? '' : '可在账号管理中补充备注',
+        }),
+    ];
+
+    accountMeta.innerHTML = metaParts.join('');
+}
+
+function renderAboutDiagnosticsPlaceholder(container, icon, title, subtitle) {
+    if (!container) return;
+
+    container.innerHTML = `
+        <div class="about-placeholder">
+            <i class="bi bi-${icon}"></i>
+            <div>
+                <div class="about-placeholder-title">${escapeHtml(title)}</div>
+                <div class="about-placeholder-sub">${escapeHtml(subtitle)}</div>
+            </div>
+        </div>
+    `;
+}
+
+function renderAboutRuntimePlaceholder(title, subtitle) {
+    const { statusContainer } = getAboutDiagnosticsElements();
+    renderAboutDiagnosticsPlaceholder(statusContainer, 'hdd-network', title, subtitle);
+}
+
+function renderAboutHistoryPlaceholder(title, subtitle) {
+    const { historyContainer } = getAboutDiagnosticsElements();
+    renderAboutDiagnosticsPlaceholder(historyContainer, 'clock-history', title, subtitle);
+}
+
+function getAboutRuntimeOverview(runtimeStatus, readinessCount = 0) {
+    if (!runtimeStatus?.running) {
+        return {
+            tone: 'danger',
+            title: '实例未启动',
+            note: '轻保活和历史消息查询都依赖账号实例，当前应先启动实例。',
+        };
+    }
+
+    if (runtimeStatus?.connection_state === 'connecting' || runtimeStatus?.connection_state === 'reconnecting') {
+        return {
+            tone: 'info',
+            title: '连接正在恢复',
+            note: '主链路还在波动，先观察连接状态与最近消息时间是否继续推进。',
+        };
+    }
+
+    if (!runtimeStatus?.ws_ready || !runtimeStatus?.session_ready || !runtimeStatus?.has_current_token) {
+        return {
+            tone: 'warning',
+            title: `${readinessCount} / 4 关键链路已就绪`,
+            note: '链路部分可用，优先处理未就绪项，再观察保活与消息链路。',
+        };
+    }
+
+    return {
+        tone: 'success',
+        title: '链路稳定可用',
+        note: '连接、轻保活与 Token 三条主信号都处于正常状态。',
+    };
+}
+
+function renderAboutRuntimeStatus(runtimeStatus) {
+    const { statusContainer } = getAboutDiagnosticsElements();
+    if (!statusContainer) return;
+
+    if (!runtimeStatus) {
+        renderAboutRuntimePlaceholder('暂无运行态', '当前账号还没有可用的运行态信息。');
+        return;
+    }
+
+    const lastConnectionDisplay = formatAboutRuntimeTime(
+        runtimeStatus.last_successful_connection_at_display,
+        runtimeStatus.last_successful_connection_at
+    );
+    const keepaliveDisplay = formatAboutRuntimeTime(
+        runtimeStatus.session_keepalive_at_display,
+        runtimeStatus.session_keepalive_at
+    );
+    const tokenRefreshDisplay = formatAboutRuntimeTime(
+        runtimeStatus.token_last_refreshed_at_display,
+        runtimeStatus.token_last_refreshed_at
+    );
+    const lastMessageDisplay = formatAboutRuntimeTime(
+        runtimeStatus.last_message_received_at_display,
+        runtimeStatus.last_message_received_at
+    );
+    const stateChangedDisplay = formatAboutRuntimeTime(
+        runtimeStatus.state_last_changed_at_display,
+        runtimeStatus.state_last_changed_at
+    );
+    const readinessItems = [
+        { label: '实例', ready: !!runtimeStatus.running },
+        { label: 'WS', ready: !!runtimeStatus.ws_ready },
+        { label: 'Session', ready: !!runtimeStatus.session_ready },
+        { label: 'Token', ready: !!runtimeStatus.has_current_token },
+    ];
+    const readinessSignalItems = readinessItems.slice(1);
+    const readinessCount = readinessItems.filter(item => item.ready).length;
+    const overview = getAboutRuntimeOverview(runtimeStatus, readinessCount);
+    const connectionTone = getAboutStatusVariant('connection', runtimeStatus.connection_state);
+    const keepaliveTone = getAboutStatusVariant('keepalive', runtimeStatus.session_keepalive_status);
+    const tokenTone = getAboutStatusVariant('token', runtimeStatus.token_refresh_status);
+    const readinessTone = readinessSignalItems.every(item => item.ready)
+        ? 'success'
+        : readinessSignalItems.some(item => item.ready)
+            ? 'warning'
+            : 'danger';
+
+    statusContainer.innerHTML = `
+        <div class="account-diagnostics-status-shell">
+            <div class="account-diagnostics-status-note-bar is-${overview.tone}">
+                <div class="account-diagnostics-status-note-title">${escapeHtml(overview.title)}</div>
+                <div class="account-diagnostics-status-note-text">${escapeHtml(overview.note)}</div>
+            </div>
+            <div class="account-diagnostics-status-grid">
+                ${buildAboutRuntimeStatusItem({
+                    label: '连接状态',
+                    value: buildAboutStatusBadge('connection', runtimeStatus.connection_state),
+                    note: `最近连接成功：${lastConnectionDisplay}`,
+                    tone: connectionTone,
+                    richValue: true,
+                    accent: 'connection',
+                    icon: 'hdd-network',
+                })}
+                ${buildAboutRuntimeStatusItem({
+                    label: '轻保活状态',
+                    value: buildAboutStatusBadge('keepalive', runtimeStatus.session_keepalive_status),
+                    note: `最近执行：${keepaliveDisplay}`,
+                    tone: keepaliveTone,
+                    richValue: true,
+                    accent: 'keepalive',
+                    icon: 'heart-pulse',
+                })}
+                ${buildAboutRuntimeStatusItem({
+                    label: 'Token 刷新状态',
+                    value: buildAboutStatusBadge('token', runtimeStatus.token_refresh_status),
+                    note: `最近刷新：${tokenRefreshDisplay}`,
+                    tone: tokenTone,
+                    richValue: true,
+                    accent: 'token',
+                    icon: 'key',
+                })}
+                ${buildAboutRuntimeStatusItem({
+                    label: '链路就绪情况',
+                    value: buildAboutReadinessValue(readinessSignalItems),
+                    note: `${readinessSignalItems.filter(item => item.ready).length} / 3 链路已就绪`,
+                    tone: readinessTone,
+                    richValue: true,
+                    accent: 'readiness',
+                    icon: 'diagram-3',
+                })}
+            </div>
+            <div class="account-diagnostics-status-meta">
+                ${buildAboutRuntimeMetaItem('最近收到消息', lastMessageDisplay)}
+                ${buildAboutRuntimeMetaItem('状态变化时间', stateChangedDisplay)}
+            </div>
+        </div>
+    `;
+}
+
+function getAboutHistoryMessageText(message) {
+    if (message == null) {
+        return '空消息';
+    }
+
+    if (typeof message === 'string') {
+        return message;
+    }
+
+    if (typeof message?.text?.text === 'string' && message.text.text.trim()) {
+        return message.text.text;
+    }
+
+    if (typeof message?.raw === 'string' && message.raw.trim()) {
+        return message.raw;
+    }
+
+    try {
+        return JSON.stringify(message, null, 2);
+    } catch (error) {
+        return String(message);
+    }
+}
+
+function getAboutHistorySenderInitial(senderName) {
+    const normalized = String(senderName || '').trim();
+    if (!normalized) {
+        return 'U';
+    }
+    return normalized.charAt(0).toUpperCase();
+}
+
+function renderAboutConversationHistory(messages, meta = {}) {
+    const { historyContainer } = getAboutDiagnosticsElements();
+    if (!historyContainer) return;
+
+    if (!Array.isArray(messages) || messages.length === 0) {
+        renderAboutHistoryPlaceholder('未查询到历史消息', '确认会话 ID 是否正确，以及该账号实例是否正在运行。');
+        return;
+    }
+
+    const summaryText = `共查询到 ${messages.length} 条消息`;
+    const conversationIdText = meta.conversationId ? `会话 ID: ${meta.conversationId}` : '';
+
+    historyContainer.innerHTML = `
+        <div class="about-history-summary">
+            <span class="about-history-summary-main">${escapeHtml(summaryText)}</span>
+            ${conversationIdText ? `<span class="about-history-summary-meta">${escapeHtml(conversationIdText)}</span>` : ''}
+        </div>
+        <div class="about-history-items">
+            ${messages.map((item, index) => {
+                const senderName = item?.send_user_name || '未知用户';
+                const senderId = item?.send_user_id || '-';
+                const senderInitial = getAboutHistorySenderInitial(senderName);
+                const messageText = getAboutHistoryMessageText(item?.message);
+                const rawText = typeof item?.message === 'object'
+                    ? (() => {
+                        try {
+                            return JSON.stringify(item.message, null, 2);
+                        } catch (error) {
+                            return messageText;
+                        }
+                    })()
+                    : messageText;
+
+                return `
+                    <div class="about-history-item">
+                        <div class="about-history-item-header">
+                            <div class="about-history-sender-block">
+                                <div class="about-history-sender-row">
+                                    <span class="about-history-sender-avatar">${escapeHtml(senderInitial)}</span>
+                                    <div class="about-history-sender-meta">
+                                        <div class="about-history-sender">${escapeHtml(senderName)}</div>
+                                        <div class="about-history-sender-id">发送者 ID: ${escapeHtml(senderId)}</div>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="about-history-index">第 ${index + 1} 条</div>
+                        </div>
+                        <div class="about-history-message-shell">
+                            <div class="about-history-message">${escapeHtml(messageText)}</div>
+                        </div>
+                        ${rawText !== messageText ? `
+                            <details class="about-history-raw">
+                                <summary>查看原始内容</summary>
+                                <pre>${escapeHtml(rawText)}</pre>
+                            </details>
+                        ` : ''}
+                    </div>
+                `;
+            }).join('')}
+        </div>
+    `;
+}
+
+function populateAboutAccountOptions(accounts) {
+    const { accountSelect } = getAboutDiagnosticsElements();
+    if (!accountSelect) return;
+
+    if (!Array.isArray(accounts) || accounts.length === 0) {
+        accountSelect.innerHTML = '<option value="">暂无账号</option>';
+        accountSelect.disabled = true;
+        return;
+    }
+
+    accountSelect.disabled = false;
+    accountSelect.innerHTML = `
+        <option value="">请选择账号</option>
+        ${accounts.map(account => {
+            const runningSuffix = account.runtime_status?.running ? ' · 运行中' : '';
+            return `<option value="${escapeHtml(account.id)}">${escapeHtml(account.id + runningSuffix)}</option>`;
+        }).join('')}
+    `;
+}
+
+async function loadAboutRuntimeStatus(accountId = '') {
+    const normalizedAccountId = String(accountId || getAboutSelectedAccountId()).trim();
+    if (!normalizedAccountId) {
+        renderAboutAccountMeta(null);
+        renderAboutRuntimePlaceholder('请选择账号', '选择账号后会显示当前连接状态、轻保活结果和最近活动时间。');
+        return;
+    }
+
+    const selectedAccount = aboutDiagnosticsAccounts.find(account => account.id === normalizedAccountId) || null;
+    renderAboutAccountMeta(selectedAccount);
+    renderAboutRuntimeStatus(selectedAccount?.runtime_status || null);
+
+    try {
+        const result = await fetchJSON(`${apiBase}/cookies/${encodeURIComponent(normalizedAccountId)}/runtime-status`);
+        const runtimeStatus = result?.runtime_status || null;
+        const targetAccount = aboutDiagnosticsAccounts.find(account => account.id === normalizedAccountId);
+        if (targetAccount) {
+            targetAccount.runtime_status = runtimeStatus;
+            renderAboutAccountMeta(targetAccount);
+        }
+        renderAboutRuntimeStatus(runtimeStatus);
+    } catch (error) {
+        console.error('加载账号运行态失败:', error);
+    }
+}
+
+async function loadAboutDiagnostics() {
+    initAboutDiagnosticsEvents();
+
+    try {
+        const previousAccountId = getAboutSelectedAccountId();
+        const accounts = await fetchJSON(`${apiBase}/cookies/details`);
+        aboutDiagnosticsAccounts = Array.isArray(accounts) ? accounts : [];
+        populateAboutAccountOptions(aboutDiagnosticsAccounts);
+
+        const { accountSelect } = getAboutDiagnosticsElements();
+        if (!accountSelect || aboutDiagnosticsAccounts.length === 0) {
+            renderAboutAccountMeta(null);
+            renderAboutRuntimePlaceholder('暂无账号', '请先在账号管理中添加闲鱼账号。');
+            renderAboutHistoryPlaceholder('暂无历史消息', '请先添加账号并确保实例已启动。');
+            return;
+        }
+
+        const nextAccountId = aboutDiagnosticsAccounts.some(account => account.id === previousAccountId)
+            ? previousAccountId
+            : (aboutDiagnosticsAccounts.find(account => account.runtime_status?.running)?.id || aboutDiagnosticsAccounts[0]?.id || '');
+
+        accountSelect.value = nextAccountId;
+        await loadAboutRuntimeStatus(nextAccountId);
+    } catch (error) {
+        console.error('加载账号保活诊断失败:', error);
+    }
+}
+
+async function refreshAboutDiagnosticsStatus() {
+    const { refreshButton } = getAboutDiagnosticsElements();
+    const accountId = getAboutSelectedAccountId();
+    if (!accountId) {
+        showToast('请先选择账号', 'warning');
+        return;
+    }
+
+    const originalHtml = refreshButton?.innerHTML;
+    if (refreshButton) {
+        refreshButton.disabled = true;
+        refreshButton.innerHTML = '<i class="bi bi-arrow-repeat me-1"></i>刷新中...';
+    }
+
+    try {
+        await loadAboutRuntimeStatus(accountId);
+        showToast(`账号 "${accountId}" 运行态已刷新`, 'success');
+    } finally {
+        if (refreshButton) {
+            refreshButton.disabled = false;
+            refreshButton.innerHTML = originalHtml;
+        }
+    }
+}
+
+async function triggerAboutSessionKeepalive() {
+    const { keepaliveButton } = getAboutDiagnosticsElements();
+    const accountId = getAboutSelectedAccountId();
+    if (!accountId) {
+        showToast('请先选择账号', 'warning');
+        return;
+    }
+
+    const originalHtml = keepaliveButton?.innerHTML;
+    if (keepaliveButton) {
+        keepaliveButton.disabled = true;
+        keepaliveButton.innerHTML = '<i class="bi bi-lightning-charge-fill me-1"></i>执行中...';
+    }
+
+    try {
+        const result = await fetchJSON(`${apiBase}/cookies/${encodeURIComponent(accountId)}/session-keepalive`, {
+            method: 'POST',
+        });
+        const targetAccount = aboutDiagnosticsAccounts.find(account => account.id === accountId);
+        if (targetAccount) {
+            targetAccount.runtime_status = result?.runtime_status || null;
+            renderAboutAccountMeta(targetAccount);
+        }
+        renderAboutRuntimeStatus(result?.runtime_status || null);
+        showToast(result?.message || '轻保活已执行', result?.success ? 'success' : 'warning');
+    } catch (error) {
+        console.error('执行轻保活失败:', error);
+    } finally {
+        if (keepaliveButton) {
+            keepaliveButton.disabled = false;
+            keepaliveButton.innerHTML = originalHtml;
+        }
+    }
+}
+
+async function loadAboutConversationHistory() {
+    const { historyButton, conversationInput } = getAboutDiagnosticsElements();
+    const accountId = getAboutSelectedAccountId();
+    const conversationId = conversationInput?.value?.trim() || '';
+
+    if (!accountId) {
+        showToast('请先选择账号', 'warning');
+        return;
+    }
+
+    if (!conversationId) {
+        showToast('请输入会话 ID', 'warning');
+        return;
+    }
+
+    const originalHtml = historyButton?.innerHTML;
+    if (historyButton) {
+        historyButton.disabled = true;
+        historyButton.innerHTML = '<i class="bi bi-chat-left-text-fill me-1"></i>查询中...';
+    }
+
+    renderAboutHistoryPlaceholder('正在查询历史消息', '请稍候，系统正在尝试拉取最近的会话消息。');
+
+    try {
+        const result = await fetchJSON(
+            `${apiBase}/cookies/${encodeURIComponent(accountId)}/conversations/${encodeURIComponent(conversationId)}/history`
+        );
+        renderAboutConversationHistory(result?.messages || [], {
+            conversationId: result?.conversation_id || conversationId,
+        });
+        showToast(`账号 "${accountId}" 历史消息查询完成`, 'success');
+    } catch (error) {
+        console.error('查询历史消息失败:', error);
+        renderAboutHistoryPlaceholder('历史消息查询失败', error?.message || '请稍后重试。');
+    } finally {
+        if (historyButton) {
+            historyButton.disabled = false;
+            historyButton.innerHTML = originalHtml;
+        }
+    }
+}
+
+function initAboutDiagnosticsEvents() {
+    if (aboutDiagnosticsInitialized) {
+        return;
+    }
+
+    const {
+        accountSelect,
+        refreshButton,
+        keepaliveButton,
+        historyButton,
+        conversationInput,
+    } = getAboutDiagnosticsElements();
+
+    accountSelect?.addEventListener('change', async () => {
+        renderAboutHistoryPlaceholder('暂无历史消息', '切换账号后，请重新输入会话 ID 并查询历史消息。');
+        await loadAboutRuntimeStatus(accountSelect.value);
+    });
+
+    refreshButton?.addEventListener('click', refreshAboutDiagnosticsStatus);
+    keepaliveButton?.addEventListener('click', triggerAboutSessionKeepalive);
+    historyButton?.addEventListener('click', loadAboutConversationHistory);
+    conversationInput?.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            loadAboutConversationHistory();
+        }
+    });
+
+    aboutDiagnosticsInitialized = true;
+}
+
+// ================================
 // 【账号管理菜单】相关功能
 // ================================
 
@@ -2716,7 +3393,7 @@ async function loadCookies() {
     if (cookieDetails.length === 0) {
         tbody.innerHTML = `
         <tr>
-            <td colspan="10" class="text-center py-4 text-muted empty-state">
+            <td colspan="11" class="text-center py-4 text-muted empty-state">
             <i class="bi bi-inbox fs-1 d-block mb-3"></i>
             <h5>暂无账号</h5>
             <p class="mb-0">请添加新的闲鱼账号开始使用</p>
@@ -2925,6 +3602,9 @@ async function loadCookies() {
     // 错误已在fetchJSON中处理
     } finally {
     toggleLoading(false);
+    if (document.getElementById('accounts-section')?.classList.contains('active')) {
+        loadAboutDiagnostics();
+    }
     }
 }
 
@@ -4053,6 +4733,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     initSidebarCollapse();
     // 初始化暗色模式
     initDarkMode();
+    // 初始化账号保活诊断事件
+    initAboutDiagnosticsEvents();
     // 加载系统版本号
     loadSystemVersion();
     // 加载防抖延迟设置

@@ -3,7 +3,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict, Any, Callable, Awaitable
 from pathlib import Path
 from urllib.parse import unquote
 import hashlib
@@ -12,7 +12,7 @@ import time
 import json
 import os
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta
 import uvicorn
 import pandas as pd
 import io
@@ -28,6 +28,7 @@ from utils.qr_login import qr_login_manager
 from utils.xianyu_utils import trans_cookies
 from utils.image_utils import image_manager
 from utils.time_utils import (
+    LOCAL_TIMEZONE,
     get_local_now,
     local_date_to_utc_end_exclusive,
     local_date_to_utc_start,
@@ -2028,12 +2029,16 @@ async def send_message_api(request: SendMessageRequest):
                 message="账号WebSocket连接未就绪，请等待重连"
             )
 
-        # 发送消息（使用清理后的所有参数）
-        await live_instance.send_msg(
-            live_instance.ws,
-            cleaned_chat_id,
-            cleaned_to_user_id,
-            cleaned_message
+        # 发送消息时需要回到账号实例所属事件循环，避免跨 loop 直接操作 ws
+        await _run_live_instance_on_manager_loop(
+            cleaned_cookie_id,
+            lambda: live_instance.send_msg(
+                live_instance.ws,
+                cleaned_chat_id,
+                cleaned_to_user_id,
+                cleaned_message
+            ),
+            timeout=15,
         )
 
         logger.info(f"API成功发送消息: {cleaned_cookie_id} -> {cleaned_to_user_id}, 内容: {cleaned_message[:50]}{'...' if len(cleaned_message) > 50 else ''}")
@@ -2043,6 +2048,15 @@ async def send_message_api(request: SendMessageRequest):
             message="消息发送成功"
         )
 
+    except HTTPException as e:
+        # 使用清理后的参数记录日志
+        cookie_id_for_log = clean_param(request.cookie_id) if 'clean_param' in locals() else request.cookie_id
+        to_user_id_for_log = clean_param(request.to_user_id) if 'clean_param' in locals() else request.to_user_id
+        logger.warning(f"API发送消息被拒绝: {cookie_id_for_log} -> {to_user_id_for_log}, 原因: {mask_sensitive_text(e.detail)}")
+        return SendMessageResponse(
+            success=False,
+            message=str(e.detail or "发送消息失败，请稍后重试")
+        )
     except Exception as e:
         # 使用清理后的参数记录日志
         cookie_id_for_log = clean_param(request.cookie_id) if 'clean_param' in locals() else request.cookie_id
@@ -2144,6 +2158,164 @@ class SystemSettingCreateIn(BaseModel):
     description: Optional[str] = None
 
 
+def _get_user_cookies_map(current_user: Dict[str, Any]) -> Dict[str, str]:
+    user_id = current_user['user_id']
+    return db_manager.get_all_cookies(user_id)
+
+
+def _ensure_cookie_access(cid: str, current_user: Dict[str, Any]) -> str:
+    cleaned_cid = str(cid or '').strip()
+    if not cleaned_cid:
+        raise HTTPException(status_code=400, detail="缺少Cookie ID")
+
+    user_cookies = _get_user_cookies_map(current_user)
+    if cleaned_cid not in user_cookies:
+        raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+    return cleaned_cid
+
+
+def _normalize_runtime_timestamp(value: Any) -> Optional[float]:
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return None
+    return timestamp if timestamp > 0 else None
+
+
+def _format_runtime_timestamp(value: Any) -> Optional[str]:
+    timestamp = _normalize_runtime_timestamp(value)
+    if timestamp is None:
+        return None
+
+    return datetime.fromtimestamp(timestamp, tz=LOCAL_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _get_runtime_age_seconds(value: Any) -> Optional[int]:
+    timestamp = _normalize_runtime_timestamp(value)
+    if timestamp is None:
+        return None
+    return max(0, int(time.time() - timestamp))
+
+
+def _build_live_runtime_status(cookie_id: str) -> Dict[str, Any]:
+    cleaned_cid = str(cookie_id or '').strip()
+    runtime_status = {
+        'instance_exists': False,
+        'running': False,
+        'connection_state': 'not_running',
+        'ws_ready': False,
+        'session_ready': False,
+        'has_current_token': False,
+        'token_refresh_status': None,
+        'token_refresh_error_message': None,
+        'token_last_refreshed_at': None,
+        'token_last_refreshed_at_display': None,
+        'token_age_seconds': None,
+        'session_keepalive_status': None,
+        'session_keepalive_error_message': None,
+        'session_keepalive_at': None,
+        'session_keepalive_at_display': None,
+        'session_keepalive_age_seconds': None,
+        'last_message_received_at': None,
+        'last_message_received_at_display': None,
+        'last_message_age_seconds': None,
+        'last_successful_connection_at': None,
+        'last_successful_connection_at_display': None,
+        'state_last_changed_at': None,
+        'state_last_changed_at_display': None,
+        'cookie_refresh_enabled': None,
+        'manual_refresh_active': False,
+    }
+    if not cleaned_cid:
+        return runtime_status
+
+    try:
+        from XianyuAutoAsync import XianyuLive
+    except Exception as e:
+        runtime_status['error'] = f"import_failed: {mask_sensitive_text(e)}"
+        return runtime_status
+
+    live_instance = XianyuLive.get_instance(cleaned_cid)
+    if not live_instance:
+        return runtime_status
+
+    connection_state = getattr(live_instance, 'connection_state', None)
+    ws = getattr(live_instance, 'ws', None)
+    session = getattr(live_instance, 'session', None)
+    token_refreshed_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_token_refresh_time', 0))
+    session_keepalive_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_session_keepalive_time', 0))
+    last_message_received_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_message_received_time', 0))
+    last_successful_connection_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_successful_connection', 0))
+    last_state_changed_at = _normalize_runtime_timestamp(getattr(live_instance, 'last_state_change_time', 0))
+
+    runtime_status.update({
+        'instance_exists': True,
+        'running': True,
+        'connection_state': getattr(connection_state, 'value', str(connection_state or 'unknown')),
+        'ws_ready': bool(ws and not getattr(ws, 'closed', False)),
+        'session_ready': bool(session and not getattr(session, 'closed', True)),
+        'has_current_token': bool(getattr(live_instance, 'current_token', None)),
+        'token_refresh_status': getattr(live_instance, 'last_token_refresh_status', None),
+        'token_refresh_error_message': getattr(live_instance, 'last_token_refresh_error_message', None),
+        'token_last_refreshed_at': token_refreshed_at,
+        'token_last_refreshed_at_display': _format_runtime_timestamp(token_refreshed_at),
+        'token_age_seconds': _get_runtime_age_seconds(token_refreshed_at),
+        'session_keepalive_status': getattr(live_instance, 'last_session_keepalive_status', None),
+        'session_keepalive_error_message': getattr(live_instance, 'last_session_keepalive_error_message', None),
+        'session_keepalive_at': session_keepalive_at,
+        'session_keepalive_at_display': _format_runtime_timestamp(session_keepalive_at),
+        'session_keepalive_age_seconds': _get_runtime_age_seconds(session_keepalive_at),
+        'last_message_received_at': last_message_received_at,
+        'last_message_received_at_display': _format_runtime_timestamp(last_message_received_at),
+        'last_message_age_seconds': _get_runtime_age_seconds(last_message_received_at),
+        'last_successful_connection_at': last_successful_connection_at,
+        'last_successful_connection_at_display': _format_runtime_timestamp(last_successful_connection_at),
+        'state_last_changed_at': last_state_changed_at,
+        'state_last_changed_at_display': _format_runtime_timestamp(last_state_changed_at),
+        'cookie_refresh_enabled': getattr(live_instance, 'cookie_refresh_enabled', None),
+        'manual_refresh_active': bool(XianyuLive.is_manual_refresh_active(cleaned_cid, allow_handoff_recovery=True)),
+    })
+    return runtime_status
+
+
+async def _run_live_instance_on_manager_loop(
+    cookie_id: str,
+    coroutine_factory: Callable[[], Awaitable[Any]],
+    *,
+    timeout: Optional[float] = None,
+) -> Any:
+    """将运行中账号实例的协程调度回 CookieManager 所属事件循环执行。"""
+    manager = getattr(cookie_manager, 'manager', None)
+    target_loop = getattr(manager, 'loop', None)
+    if not target_loop:
+        raise HTTPException(status_code=500, detail="CookieManager 未就绪")
+
+    if hasattr(target_loop, 'is_closed') and target_loop.is_closed():
+        raise HTTPException(status_code=500, detail="账号事件循环已关闭")
+
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    if current_loop is target_loop:
+        return await coroutine_factory()
+
+    if not target_loop.is_running():
+        raise HTTPException(status_code=500, detail="账号事件循环未运行")
+
+    thread_future = asyncio.run_coroutine_threadsafe(coroutine_factory(), target_loop)
+    wrapped_future = asyncio.wrap_future(thread_future)
+
+    try:
+        if timeout and timeout > 0:
+            return await asyncio.wait_for(wrapped_future, timeout=timeout)
+        return await wrapped_future
+    except asyncio.TimeoutError:
+        thread_future.cancel()
+        raise HTTPException(status_code=504, detail="账号处理超时，请稍后重试")
+
+
 
 
 
@@ -2165,10 +2337,7 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
     if cookie_manager.manager is None:
         return []
 
-    # 获取当前用户的cookies
-    user_id = current_user['user_id']
-    from db_manager import db_manager
-    user_cookies = db_manager.get_all_cookies(user_id)
+    user_cookies = _get_user_cookies_map(current_user)
 
     result = []
     for cookie_id, cookie_value in user_cookies.items():
@@ -2191,7 +2360,8 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
             'remark': remark,
             'username': username,
             'has_password': has_password,
-            'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10
+            'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10,
+            'runtime_status': _build_live_runtime_status(cookie_id),
         })
     return result
 
@@ -2325,19 +2495,15 @@ def update_cookie_account_info(cid: str, info: CookieAccountInfo, current_user: 
 def get_cookie_account_details(cid: str, include_secrets: bool = False, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取账号详细信息（包括用户名、密码、显示浏览器设置）"""
     try:
-        # 检查cookie是否属于当前用户
-        user_id = current_user['user_id']
-        from db_manager import db_manager
-        user_cookies = db_manager.get_all_cookies(user_id)
-
-        if cid not in user_cookies:
-            raise HTTPException(status_code=403, detail="无权限操作该Cookie")
+        cid = _ensure_cookie_access(cid, current_user)
 
         # 获取详细信息
         details = db_manager.get_cookie_details(cid)
         
         if not details:
             raise HTTPException(status_code=404, detail="账号不存在")
+
+        runtime_status = _build_live_runtime_status(cid)
 
         if not include_secrets:
             details = {
@@ -2348,6 +2514,12 @@ def get_cookie_account_details(cid: str, include_secrets: bool = False, current_
                 'has_cookie_value': bool(details.get('value')),
                 'has_password': bool(details.get('password')),
                 'has_proxy_pass': bool(details.get('proxy_pass')),
+                'runtime_status': runtime_status,
+            }
+        else:
+            details = {
+                **details,
+                'runtime_status': runtime_status,
             }
         
         return details
@@ -2356,6 +2528,103 @@ def get_cookie_account_details(cid: str, include_secrets: bool = False, current_
     except Exception as e:
         logger.error(f"获取账号详情失败: {mask_sensitive_text(e)}")
         raise HTTPException(status_code=400, detail=safe_client_error("获取账号详情失败，请稍后重试"))
+
+
+@app.get("/cookies/{cid}/runtime-status")
+def get_cookie_runtime_status(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """获取账号运行态状态，便于排查保活/连接问题。"""
+    try:
+        cid = _ensure_cookie_access(cid, current_user)
+        return {
+            'cookie_id': cid,
+            'runtime_status': _build_live_runtime_status(cid),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取账号运行态失败: {cid} - {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=400, detail=safe_client_error("获取账号运行态失败，请稍后重试"))
+
+
+@app.get("/cookies/{cid}/conversations/{conversation_id}/history")
+async def get_conversation_history(
+    cid: str,
+    conversation_id: str,
+    page_size: int = 20,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """获取指定会话的历史消息。"""
+    try:
+        cid = _ensure_cookie_access(cid, current_user)
+        normalized_conversation_id = str(conversation_id or '').strip().split('@')[0]
+        if not normalized_conversation_id:
+            raise HTTPException(status_code=400, detail="缺少会话ID")
+
+        normalized_page_size = max(1, min(int(page_size or 20), 100))
+
+        from XianyuAutoAsync import XianyuLive
+        live_instance = XianyuLive.get_instance(cid)
+        if not live_instance:
+            raise HTTPException(status_code=400, detail="账号未启动，暂无法查询历史消息")
+
+        log_with_user(
+            'info',
+            f"开始查询账号 {cid} 会话 {normalized_conversation_id} 的历史消息，page_size={normalized_page_size}",
+            current_user
+        )
+        history_messages = await _run_live_instance_on_manager_loop(
+            cid,
+            lambda: live_instance.list_all_conversations(
+                normalized_conversation_id,
+                page_size=normalized_page_size,
+            ),
+            timeout=60,
+        )
+        return {
+            'success': True,
+            'cookie_id': cid,
+            'conversation_id': normalized_conversation_id,
+            'page_size': normalized_page_size,
+            'count': len(history_messages),
+            'messages': history_messages,
+            'runtime_status': _build_live_runtime_status(cid),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取历史消息失败: {cid}/{conversation_id} - {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=400, detail=safe_client_error("获取历史消息失败，请稍后重试"))
+
+
+@app.post("/cookies/{cid}/session-keepalive")
+async def trigger_session_keepalive(cid: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """手动触发一次轻量会话保活。"""
+    try:
+        cid = _ensure_cookie_access(cid, current_user)
+
+        from XianyuAutoAsync import XianyuLive
+        live_instance = XianyuLive.get_instance(cid)
+        if not live_instance:
+            raise HTTPException(status_code=400, detail="账号未启动，暂无法执行轻量保活")
+
+        log_with_user('info', f"手动触发账号 {cid} 的轻量会话保活", current_user)
+        keepalive_ok = await _run_live_instance_on_manager_loop(
+            cid,
+            lambda: live_instance.keep_session_alive(),
+            timeout=40,
+        )
+        runtime_status = _build_live_runtime_status(cid)
+        return {
+            'success': keepalive_ok,
+            'cookie_id': cid,
+            'message': '轻量会话保活成功' if keepalive_ok else '轻量会话保活失败',
+            'runtime_status': runtime_status,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"手动轻量保活失败: {cid} - {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=400, detail=safe_client_error("手动轻量保活失败，请稍后重试"))
 
 
 # ========================= 代理配置相关接口 =========================
