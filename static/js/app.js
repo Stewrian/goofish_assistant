@@ -6334,7 +6334,8 @@ const templatePreviewData = {
     },
     slider_success: {
         account_id: 'test_account',
-        time: new Date().toLocaleString('zh-CN')
+        time: new Date().toLocaleString('zh-CN'),
+        status_text: 'cookies已自动更新到数据库'
     },
     face_verify: {
         account_id: 'test_account',

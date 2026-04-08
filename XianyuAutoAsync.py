@@ -8848,18 +8848,17 @@ class XianyuLive:
                 self.pending_notification_keys.add(notification_key)
 
             # 构造通知消息（使用模板）
-            if notification_type == "slider_recovered_success":
-                notification_msg = (
-                    "✅ 滑块验证成功，账号会话已恢复\n\n"
-                    f"账号: {self.cookie_id}\n"
-                    f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            if notification_type in ("slider_success", "slider_recovered_success"):
+                slider_status_text = (
+                    "账号会话已恢复"
+                    if notification_type == "slider_recovered_success"
+                    else "cookies已自动更新到数据库"
                 )
-            # 判断异常信息中是否包含"滑块验证成功"
-            elif "滑块验证成功" in error_message:
                 notification_msg = render_notification_template(
                     'slider_success',
                     account_id=self.cookie_id,
-                    time=time.strftime('%Y-%m-%d %H:%M:%S')
+                    time=time.strftime('%Y-%m-%d %H:%M:%S'),
+                    status_text=slider_status_text
                 )
             elif "密码登录成功" in error_message or notification_type == "password_login_success":
                 notification_msg = render_notification_template(

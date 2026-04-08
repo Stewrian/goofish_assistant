@@ -4714,7 +4714,8 @@ async def test_notification_template(data: TestNotificationIn, current_user: Dic
             },
             'slider_success': {
                 'account_id': '测试账号',
-                'time': time_module.strftime('%Y-%m-%d %H:%M:%S')
+                'time': time_module.strftime('%Y-%m-%d %H:%M:%S'),
+                'status_text': 'cookies已自动更新到数据库'
             },
             'face_verify': {
                 'account_id': '测试账号',

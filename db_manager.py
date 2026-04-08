@@ -855,7 +855,7 @@ class DBManager:
 时间: {time}
 
 请及时处理！'),
-            ('slider_success', '✅ 滑块验证成功，cookies已自动更新到数据库
+            ('slider_success', '✅ 滑块验证成功，{status_text}
 
 账号: {account_id}
 时间: {time}'),
@@ -1110,7 +1110,7 @@ Cookie数量: {cookie_count}
                 # 插入新的默认模板（包括之前可能缺失的）
                 cursor.execute('''
                 INSERT OR IGNORE INTO notification_templates (type, template) VALUES
-                ('slider_success', '✅ 滑块验证成功，cookies已自动更新到数据库
+                ('slider_success', '✅ 滑块验证成功，{status_text}
 
 账号: {account_id}
 时间: {time}'),
@@ -1138,7 +1138,25 @@ Cookie数量: {cookie_count}
 账号已可正常使用。')
                 ''')
 
-                logger.info("通知模板类型迁移完成")
+            old_slider_success_template = '''✅ 滑块验证成功，cookies已自动更新到数据库
+
+账号: {account_id}
+时间: {time}'''
+            new_slider_success_template = '''✅ 滑块验证成功，{status_text}
+
+账号: {account_id}
+时间: {time}'''
+            self._execute_sql(
+                cursor,
+                '''
+                UPDATE notification_templates
+                SET template = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE type = 'slider_success' AND template = ?
+                ''',
+                (new_slider_success_template, old_slider_success_template)
+            )
+
+            logger.info("通知模板类型迁移完成")
         except Exception as e:
             logger.warning(f"迁移notification_templates表时出错（可能表不存在）: {e}")
             # 如果迁移失败，尝试清理
@@ -3491,7 +3509,7 @@ Cookie数量: {cookie_count}
 时间: {time}
 
 请及时处理！''',
-            'slider_success': '''✅ 滑块验证成功，cookies已自动更新到数据库
+            'slider_success': '''✅ 滑块验证成功，{status_text}
 
 账号: {account_id}
 时间: {time}''',
@@ -3554,7 +3572,7 @@ Cookie数量: {cookie_count}
 时间: {time}
 
 请及时处理！''',
-            'slider_success': '''✅ 滑块验证成功，cookies已自动更新到数据库
+            'slider_success': '''✅ 滑块验证成功，{status_text}
 
 账号: {account_id}
 时间: {time}''',
